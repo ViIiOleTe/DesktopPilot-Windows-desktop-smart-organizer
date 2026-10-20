@@ -148,7 +148,7 @@ def test_windows_data_path(tmp_path, monkeypatch):
     assert windows.default_data_dir() == tmp_path / "local" / "DesktopPilot"
 
 
-def mock_shell(monkeypatch, *, status=0, value="C:\\Users\\test\\OneDrive\\Desktop"):
+def mock_shell(monkeypatch, *, status=0, value=r"C:\Users\test\OneDrive\Desktop"):
     buffer = ctypes.create_unicode_buffer(value)
     shell, ole = Mock(), Mock()
     def read_path(folder_id, flags, token, output):
@@ -167,7 +167,7 @@ def mock_shell(monkeypatch, *, status=0, value="C:\\Users\\test\\OneDrive\\Deskt
 def test_windows_discovery_uses_known_folder_and_frees_memory(monkeypatch):
     buffer, shell, ole = mock_shell(monkeypatch)
     monkeypatch.setattr(windows.sys, "platform", "win32")
-    assert str(windows.discover_desktop()) == "C:\\Users\\test\\OneDrive\\Desktop"
+    assert windows.discover_desktop() == Path(r"C:\Users\test\OneDrive\Desktop")
     shell.SHGetKnownFolderPath.assert_called_once()
     ole.CoTaskMemFree.assert_called_once()
     assert ole.CoTaskMemFree.call_args.args[0].value == ctypes.addressof(buffer)

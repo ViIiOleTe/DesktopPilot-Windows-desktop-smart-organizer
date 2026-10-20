@@ -47,7 +47,7 @@ jobs:
         shell: pwsh
         run: |
           $report = Join-Path $env:RUNNER_TEMP 'desktoppilot-smoke.json'
-          $process = Start-Process -FilePath .\dist\DesktopPilot.exe -ArgumentList @('--smoke-test', $report) -Wait -PassThru
+          $process = Start-Process -FilePath .\dist\DesktopPilot.exe -ArgumentList @('--smoke-test', ('"' + $report + '"')) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "DesktopPilot smoke test failed: exit $($process.ExitCode)" }
           if (!(Test-Path $report)) { throw 'DesktopPilot smoke test did not create a report' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
