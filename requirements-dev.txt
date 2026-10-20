@@ -1,0 +1,4 @@
+-r requirements.txt
+-e .
+pytest==8.3.5
+pyinstaller==6.13.0
