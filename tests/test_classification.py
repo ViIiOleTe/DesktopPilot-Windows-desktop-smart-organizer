@@ -35,6 +35,11 @@ def test_system_and_folder_rules_take_priority_over_game_patterns():
     assert classify(icon("System", is_filesystem=False, is_folder=True), settings) == "system"
 
 
+@pytest.mark.parametrize("name", ["Game guide.pdf", "Game screenshot.png", "Game backup.zip"])
+def test_game_rules_do_not_reclassify_ordinary_documents(name):
+    assert classify(icon(name), Settings(game_rules=["*Game*"])) == "file"
+
+
 def test_valid_identity_override_has_highest_priority():
     settings = Settings(category_overrides={"identity": "game"})
     assert classify(icon("ordinary.txt"), settings) == "game"

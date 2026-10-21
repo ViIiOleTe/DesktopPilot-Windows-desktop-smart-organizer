@@ -25,6 +25,9 @@ def classify(icon: Icon, settings: Settings) -> str:
         return "system"
     if icon.is_folder:
         return "folder"
+    suffix = PureWindowsPath(icon.parsing_name or icon.name).suffix.casefold()
+    if not (icon.is_shortcut or suffix in {".lnk", ".url", ".exe", ".com", ".appref-ms"}):
+        return "file"
     candidates = (icon.name, icon.parsing_name, icon.target, icon.arguments)
     patterns = settings.game_rules
     if any(
@@ -33,10 +36,7 @@ def classify(icon: Icon, settings: Settings) -> str:
         for pattern in patterns
     ):
         return "game"
-    suffix = PureWindowsPath(icon.parsing_name or icon.name).suffix.casefold()
-    if icon.is_shortcut or suffix in {".lnk", ".url", ".exe", ".com", ".appref-ms"}:
-        return "software"
-    return "file"
+    return "software"
 
 
 def classify_icons(state: DesktopState, settings: Settings) -> DesktopState:
