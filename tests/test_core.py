@@ -1,356 +1,323 @@
+"""Coordinate tests use fake shell state and a temporary application data dir."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
-import os
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from desktop_pilot import core
-from desktop_pilot.core import CATEGORY_NAMES, Engine, MoveItem, OUTPUT_FOLDER, Settings, classify
+from desktop_pilot.core import Engine
+from desktop_pilot.models import DesktopState, Icon, LayoutPlan, Monitor, Point, Rect, Settings
+from desktop_pilot.storage import JsonStore
+
+
+class FakeBackend:
+    def __init__(self, state):
+        self.state = state
+        self.calls = []
+
+    def read(self):
+        return self.state
+
+    def position(self, positions):
+        self.calls.append(dict(positions))
+        self.state = replace(self.state, icons=tuple(replace(icon, position=positions.get(icon.identity, icon.position)) for icon in self.state.icons))
+        return self.state
 
 
 @pytest.fixture
-def engine(tmp_path):
-    desktop = tmp_path / "desktop"
-    desktop.mkdir()
-    return Engine(desktop, tmp_path / "state")
+def prepared(tmp_path):
+    state = DesktopState(
+        icons=(
+            Icon("folder-id", "学习资料", r"C:\Desktop\学习资料", Point(300, 200), is_folder=True),
+            Icon("app-id", "编辑器", r"C:\Desktop\编辑器.lnk", Point(200, 100), is_shortcut=True),
+            Icon("game-id", "Game", r"C:\Desktop\Game.url", Point(400, 100), is_shortcut=True, target="steam://rungameid/123"),
+            Icon("file-id", "讲义.txt", r"C:\Desktop\讲义.txt", Point(100, 200)),
+            Icon("recycle-id", "回收站", "::{recycle-bin}", Point(500, 200), is_filesystem=False),
+        ),
+        monitors=(Monitor("main", Rect(0, 0, 600, 400)),),
+        spacing=Point(100, 100),
+    )
+    backend = FakeBackend(state)
+    return Engine(backend=backend, data_dir=tmp_path / "state"), backend
 
 
-def write(engine, name, data=b"user content"):
-    path = engine.desktop / name
-    path.write_bytes(data)
-    return path
+def positions(state):
+    return {icon.identity: icon.position for icon in state.icons}
 
 
-@pytest.mark.parametrize(("filename", "category"), [
-    ("lesson.PDF", 0), ("notes.docx", 0), ("sheet.xlsx", 0), ("slides.pptx", 0),
-    ("screenshot.PNG", 1), ("photo.heic", 1), ("music.flac", 2), ("clip.mp4", 2),
-    ("module.py", 3), ("script.ps1", 3), ("archive.tar.gz", 4), ("data.7z", 4),
-    ("Browser.LNK", 5), ("Website.URL", 5), ("unknown.custom", 6), ("LICENSE", 6),
-])
-def test_categories(filename, category):
-    assert classify(Path(filename)) == CATEGORY_NAMES[category]
-
-
-def test_scan_statistics_and_root_only(engine):
-    for name in ["report.pdf", "other.pdf", "photo.png", "app.LNK", "link.url", "no-extension"]:
-        write(engine, name)
-    folder = engine.desktop / "existing-folder"
-    folder.mkdir()
-    (folder / "nested.pdf").write_bytes(b"nested")
+def test_scan_classifies_without_positioning(prepared):
+    engine, backend = prepared
     scan = engine.scan()
-    assert len(scan.files) == 6
-    assert scan.shortcut_count == 2
-    assert scan.ignored_count == 1
-    assert scan.extension_counts[".pdf"] == 2
-    assert scan.category_counts[CATEGORY_NAMES[5]] == 2
+    assert [icon.category for icon in scan.icons] == ["folder", "software", "game", "file", "system"]
+    assert not backend.calls
+    assert positions(scan) == positions(backend.state)
 
 
-def test_protected_files_directories_custom_ignore_and_symlinks(engine):
-    for name in ["desktop.ini", "Desktop.INI", ".hidden", "application.EXE", "installer.msi", "library.dll", "keep-private.TXT", "good.txt"]:
-        write(engine, name)
-    (engine.desktop / OUTPUT_FOLDER).mkdir()
-    (engine.desktop / OUTPUT_FOLDER / "never.pdf").write_bytes(b"untouched")
-    target = write(engine, "target.txt")
-    try:
-        (engine.desktop / "shortcut-link").symlink_to(target)
-    except OSError:
-        pass  # Windows runners can lack symbolic-link privilege.
-    engine.save_settings(Settings(ignored_patterns=["KEEP-*.txt"]))
-    assert {item.source.name for item in engine.scan().files} == {"good.txt", "target.txt"}
-    assert (engine.desktop / OUTPUT_FOLDER / "never.pdf").read_bytes() == b"untouched"
-
-
-@pytest.mark.parametrize("attribute", [0x2, 0x4, 0x400])
-def test_hidden_system_reparse_stat_flags(engine, attribute):
-    path = write(engine, "system.txt")
-    info = path.lstat()
-    fake = SimpleNamespace(st_mode=info.st_mode, st_file_attributes=attribute)
-    assert engine._ignored(path, fake)
-
-
-def test_trusted_onedrive_root_can_have_cloud_reparse_metadata(engine, monkeypatch):
-    source = write(engine, "local-note.txt")
-    original_lstat = Path.lstat
-    def with_cloud_attributes(path):
-        info = original_lstat(path)
-        if path == engine.desktop:
-            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
-        return info
-    monkeypatch.setattr(Path, "lstat", with_cloud_attributes)
-    assert [file.source for file in engine.scan().files] == [source]
-
-
-def test_preview_is_non_mutating_and_respects_kept_shortcuts(engine):
-    keep = write(engine, "Browser.LNK")
-    move = write(engine, "Website.url")
-    engine.save_settings(Settings(keep_shortcuts=["browser.lnk"]))
-    scan = engine.scan()
-    assert scan.shortcut_count == 2
-    plan = engine.preview(scan)
-    assert [item.source for item in plan] == [move]
-    assert keep.exists() and move.exists()
-    assert not (engine.desktop / OUTPUT_FOLDER).exists()
-
-
-def test_organize_undo_and_reload_preserve_bytes(engine):
-    originals = {name: bytes(range(256)) * 8 for name in ["document.pdf", "image.png", "Editor.lnk", "site.url"]}
-    for name, content in originals.items():
-        write(engine, name, content)
+def test_preview_never_changes_shell_or_writes_snapshot(prepared):
+    engine, backend = prepared
+    original = backend.state
     plan = engine.preview()
-    notifications = []
-    result = engine.organize(plan, lambda current, total: notifications.append((current, total)))
-    assert result.moved_count == 4 and not result.errors
-    assert notifications == [(1, 4), (2, 4), (3, 4), (4, 4)]
-    for item in plan:
-        assert not item.source.exists()
-        assert item.destination.read_bytes() == originals[item.source.name]
-    reloaded = Engine(engine.desktop, engine._store.data_dir)
-    assert reloaded.history()[0]["status"] == "completed"
-    undone = reloaded.undo()
-    assert undone.moved_count == 4 and not undone.errors
-    assert reloaded.history()[0]["status"] == "undone"
-    for name, content in originals.items():
-        assert (engine.desktop / name).read_bytes() == content
-    assert all(not item.destination.exists() for item in plan)
+    assert len(plan.items) == len(original.icons)
+    assert backend.state == original and not backend.calls
+    assert engine.saved_layouts() == []
 
 
-def test_deselected_files_and_empty_selection(engine):
-    first = write(engine, "a.txt")
-    second = write(engine, "b.txt")
+def test_organize_and_undo_roundtrip_coordinates_after_restart(prepared):
+    engine, backend = prepared
+    original = positions(backend.state)
     plan = engine.preview()
-    plan[0].selected = False
     result = engine.organize(plan)
-    assert result.moved_count == 1 and not result.errors
-    assert first.exists() and not second.exists()
-    empty = engine.organize([])
-    assert empty.moved_count == 0 and not empty.errors
+    assert not result.errors and result.changed_count > 0
+    assert positions(backend.state) == {item.identity: item.destination for item in plan.items}
+    snapshot = engine.history()[0]
+    assert snapshot["kind"] == "before_arrange" and snapshot["status"] == "applied" and snapshot["can_undo"]
+    reopened = Engine(backend, engine.data_dir)
+    undone = reopened.undo()
+    assert not undone.errors and undone.changed_count > 0
+    assert positions(backend.state) == original
+    assert reopened.history()[1]["status"] == "undone"
+    assert reopened.history()[0]["kind"] == "before_undo" and not reopened.history()[0]["can_undo"]
+    assert reopened.undo().changed_count == 0
 
 
-def test_destination_collision_suffix_and_race_never_overwrite(engine):
-    source = write(engine, "report.pdf", b"new")
-    directory = engine.desktop / OUTPUT_FOLDER / CATEGORY_NAMES[0]
-    directory.mkdir(parents=True)
-    existing = directory / "REPORT.PDF"
-    existing.write_bytes(b"old")
-    plan = engine.preview()
-    assert plan[0].destination.name == "report (2).pdf"
-    plan[0].destination.write_bytes(b"arrived after preview")
-    result = engine.organize(plan)
-    assert result.moved_count == 0 and result.errors
-    assert source.read_bytes() == b"new"
-    assert existing.read_bytes() == b"old"
-    assert plan[0].destination.read_bytes() == b"arrived after preview"
+def test_save_named_layout_and_restore_via_preview(prepared):
+    engine, backend = prepared
+    original = positions(backend.state)
+    saved = engine.save_layout("工作布局")
+    assert saved["name"] == "工作布局" and not saved["can_undo"]
+    assert not backend.calls
+    assert not engine.organize(engine.preview()).errors
+    restore = engine.restore_preview(saved["id"])
+    assert restore.kind == "restore"
+    assert not engine.organize(restore).errors
+    assert positions(backend.state) == original
 
 
-def test_source_changed_after_preview_is_not_moved(engine):
-    source = write(engine, "report.txt", b"before")
-    plan = engine.preview()
-    source.write_bytes(b"modified since preview")
-    result = engine.organize(plan)
-    assert result.moved_count == 0 and result.errors
-    assert source.read_bytes() == b"modified since preview"
+def test_snapshot_precedes_every_native_coordinate_write(prepared, monkeypatch):
+    engine, backend = prepared
+    original_position = backend.position
+    def checked(positions):
+        snapshots = json.loads((engine.data_dir / JsonStore.LAYOUTS_NAME).read_text(encoding="utf-8"))
+        assert snapshots[-1]["status"] == "pending"
+        assert {icon["identity"]: Point(icon["x"], icon["y"]) for icon in snapshots[-1]["icons"]} == globals()["positions"](backend.state)
+        return original_position(positions)
+    monkeypatch.setattr(backend, "position", checked)
+    assert not engine.organize(engine.preview()).errors
 
 
-def test_removed_source_partial_failure_does_not_lose_other_moves(engine):
-    missing = write(engine, "a.txt")
-    kept = write(engine, "b.txt", b"other file")
-    plan = engine.preview()
-    missing.unlink()
-    result = engine.organize(plan)
-    assert result.moved_count == 1 and len(result.errors) == 1
-    assert engine.history()[0]["status"] == "partial"
-    assert engine.undo().moved_count == 1
-    assert kept.read_bytes() == b"other file"
-
-
-def test_reject_forged_or_modified_preview_paths(engine, tmp_path):
-    source = write(engine, "a.txt")
-    forged = MoveItem(source, tmp_path / "stolen.txt", CATEGORY_NAMES[0])
-    assert engine.organize([forged]).errors
-    plan = engine.preview()
-    plan[0].destination = tmp_path / "outside.txt"
-    assert engine.organize(plan).errors
-    assert source.exists()
-    assert not (tmp_path / "outside.txt").exists()
-
-
-def test_new_keep_setting_invalidates_shortcut_move(engine):
-    source = write(engine, "Browser.lnk")
-    plan = engine.preview()
-    engine.save_settings(Settings(keep_shortcuts=["BROWSER.LNK"]))
-    result = engine.organize(plan)
-    assert result.errors and result.moved_count == 0
-    assert source.exists()
-
-
-def test_undo_does_not_overwrite_new_desktop_file(engine):
-    original = write(engine, "report.txt", b"original")
-    plan = engine.preview()
-    assert not engine.organize(plan).errors
-    original.write_bytes(b"new desktop file")
-    result = engine.undo()
-    assert result.moved_count == 0 and result.errors
-    assert original.read_bytes() == b"new desktop file"
-    assert plan[0].destination.read_bytes() == b"original"
-    original.rename(engine.desktop / "new desktop file.txt")
-    assert engine.undo().moved_count == 1
-    assert original.read_bytes() == b"original"
-
-
-def test_undo_refuses_modified_or_replaced_destination(engine):
-    write(engine, "report.txt", b"original")
-    plan = engine.preview()
-    engine.organize(plan)
-    plan[0].destination.write_bytes(b"changed")
-    result = engine.undo()
-    assert result.errors and result.moved_count == 0
-    assert plan[0].destination.read_bytes() == b"changed"
-    assert not plan[0].source.exists()
-
-
-def test_undo_missing_destination_reports_error(engine):
-    write(engine, "report.txt")
-    plan = engine.preview()
-    engine.organize(plan)
-    # Simulate the user moving their file elsewhere; DesktopPilot must not guess.
-    elsewhere = engine.desktop.parent / "elsewhere.txt"
-    plan[0].destination.rename(elsewhere)
-    result = engine.undo()
-    assert result.errors and result.moved_count == 0
-    assert elsewhere.read_bytes() == b"user content"
-
-
-def test_multiple_batches_undo_latest_first(engine):
-    a = write(engine, "a.txt")
-    engine.organize(engine.preview())
-    b = write(engine, "b.txt")
-    engine.organize(engine.preview())
-    assert engine.undo().moved_count == 1
-    assert b.exists() and not a.exists()
-    assert engine.undo().moved_count == 1
-    assert a.exists()
-    assert engine.undo().moved_count == 0
-
-
-def test_failed_journal_before_move_leaves_source(engine, monkeypatch):
-    source = write(engine, "a.txt")
+def test_snapshot_failure_prevents_any_native_write(prepared, monkeypatch):
+    engine, backend = prepared
     plan = engine.preview()
     def fail(_):
         raise OSError("disk full")
-    monkeypatch.setattr(engine._store, "save_history", fail)
+    monkeypatch.setattr(engine._store, "save_layouts", fail)
     result = engine.organize(plan)
-    assert result.errors and result.moved_count == 0
-    assert source.exists() and not plan[0].destination.exists()
+    assert result.errors and result.changed_count == 0 and not backend.calls
 
 
-def test_journal_write_failure_after_move_can_be_undone_after_restart(engine, monkeypatch):
-    source = write(engine, "a.txt", b"recoverable")
-    plan = engine.preview()
-    original_save = engine._store.save_history
+def test_final_journal_write_failure_retains_recoverable_snapshot(prepared, monkeypatch):
+    engine, backend = prepared
+    original = positions(backend.state)
+    save = engine._store.save_layouts
     calls = 0
-    def fail_after_move(history):
+    def fail_after_native(layouts):
         nonlocal calls
         calls += 1
-        if calls == 3:
-            raise OSError("disk became full after physical move")
-        original_save(history)
-    monkeypatch.setattr(engine._store, "save_history", fail_after_move)
-    result = engine.organize(plan)
-    assert result.errors and result.moved_count == 1
-    assert not source.exists()
-    reloaded = Engine(engine.desktop, engine._store.data_dir)
-    assert reloaded.history()[0]["entries"][0]["status"] == "moving"
-    assert reloaded.undo().moved_count == 1
-    assert source.read_bytes() == b"recoverable"
+        if calls == 2:
+            raise OSError("disk became full")
+        save(layouts)
+    monkeypatch.setattr(engine._store, "save_layouts", fail_after_native)
+    result = engine.organize(engine.preview())
+    assert result.errors and result.changed_count > 0
+    reopened = Engine(backend, engine.data_dir)
+    assert reopened.history()[0]["status"] == "pending"
+    assert not reopened.undo().errors
+    assert positions(backend.state) == original
 
 
-def test_journal_intent_precedes_filesystem_move(engine, monkeypatch):
-    write(engine, "a.txt")
-    original_move = core._move_no_replace
-    def checked_move(source, destination, expected_identity=None):
-        record = json.loads((engine._store.data_dir / "history.json").read_text(encoding="utf-8"))[-1]
-        assert record["entries"][0]["status"] == "moving"
-        assert len(record["entries"][0]["sha256"]) == 64
-        original_move(source, destination, expected_identity)
-    monkeypatch.setattr(core, "_move_no_replace", checked_move)
-    assert engine.organize(engine.preview()).moved_count == 1
+def test_native_partial_failure_reports_and_keeps_undo(prepared, monkeypatch):
+    engine, backend = prepared
+    original = positions(backend.state)
+    position = backend.position
+    def partial_then_fail(mapping):
+        identity = next(iter(mapping))
+        position({identity: mapping[identity]})
+        raise OSError("Explorer stopped after one item")
+    monkeypatch.setattr(backend, "position", partial_then_fail)
+    result = engine.organize(engine.preview())
+    assert result.errors and result.changed_count == 1
+    assert engine.history()[0]["status"] == "partial"
+    monkeypatch.setattr(backend, "position", position)
+    assert not engine.undo().errors
+    assert positions(backend.state) == original
 
 
-def test_source_replaced_during_journal_write_is_not_moved(engine, monkeypatch):
-    source = write(engine, "a.txt", b"original")
+def test_readback_must_confirm_actual_target_coordinates(prepared, monkeypatch):
+    engine, backend = prepared
+    monkeypatch.setattr(backend, "position", lambda mapping: backend.state)
+    result = engine.organize(engine.preview())
+    assert result.errors and result.changed_count == 0
+    assert engine.history()[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("change", ["icon", "monitor", "dpi", "spacing", "auto_arrange", "rename"])
+def test_stale_preview_is_refused_without_native_writes(prepared, change):
+    engine, backend = prepared
     plan = engine.preview()
-    original_save = engine._store.save_history
-    replaced = False
-    def replace_after_fsync(history):
-        nonlocal replaced
-        original_save(history)
-        if history[-1]["entries"][0]["status"] == "moving" and not replaced:
-            source.rename(engine.desktop / "original-preserved.txt")
-            source.write_bytes(b"new file")
-            replaced = True
-    monkeypatch.setattr(engine._store, "save_history", replace_after_fsync)
+    if change == "icon":
+        backend.state = replace(backend.state, icons=backend.state.icons + (Icon("new-id", "new", "new", Point(0, 300)),))
+    elif change == "monitor":
+        backend.state = replace(backend.state, monitors=(Monitor("new", Rect(0, 0, 600, 400)),))
+    elif change == "dpi":
+        backend.state = replace(backend.state, monitors=(replace(backend.state.monitors[0], dpi=144),))
+    elif change == "spacing":
+        backend.state = replace(backend.state, spacing=Point(80, 80))
+    elif change == "auto_arrange":
+        backend.state = replace(backend.state, auto_arrange=True)
+    else:
+        backend.state = replace(backend.state, icons=(replace(backend.state.icons[0], name="Renamed"),) + backend.state.icons[1:])
     result = engine.organize(plan)
-    assert result.errors and result.moved_count == 0
-    assert source.read_bytes() == b"new file"
-    assert not plan[0].destination.exists()
+    assert result.errors and not backend.calls
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX no-replace branch")
-def test_exclusive_link_collision_race_preserves_both_files(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    destination = tmp_path / "destination"
-    source.write_bytes(b"source bytes")
-    original_link = os.link
-    def race_link(src, dst, **kwargs):
-        destination.write_bytes(b"racing writer")
-        original_link(src, dst, **kwargs)
-    monkeypatch.setattr(core.os, "link", race_link)
-    with pytest.raises(FileExistsError):
-        core._move_no_replace(source, destination)
-    assert source.read_bytes() == b"source bytes"
-    assert destination.read_bytes() == b"racing writer"
+def test_setting_change_after_preview_requires_new_confirmation(prepared):
+    engine, backend = prepared
+    plan = engine.preview()
+    engine.save_settings(Settings(direction="row"))
+    assert engine.organize(plan).errors and not backend.calls
 
 
-def test_operation_lock_prevents_second_engine(engine):
-    write(engine, "a.txt")
-    second = Engine(engine.desktop, engine._store.data_dir)
+def test_settings_changed_by_other_instance_invalidate_preview(prepared):
+    engine, backend = prepared
+    plan = engine.preview()
+    second = Engine(backend, engine.data_dir)
+    second.save_settings(Settings(category_gap=0))
+    assert engine.organize(plan).errors and not backend.calls
+
+
+def test_forged_and_tampered_plans_are_refused(prepared):
+    engine, backend = prepared
+    plan = engine.preview()
+    forged = LayoutPlan(plan.state, plan.items, token=plan.token)
+    assert engine.organize(forged).errors
+    plan.items = (replace(plan.items[0], destination=Point(9999, 9999)),) + plan.items[1:]
+    assert engine.organize(plan).errors and not backend.calls
+
+
+def test_snapshot_io_change_is_rechecked_before_native_write(prepared, monkeypatch):
+    engine, backend = prepared
+    plan = engine.preview()
+    save = engine._store.save_layouts
+    changed = False
+    def mutate_after_flush(layouts):
+        nonlocal changed
+        save(layouts)
+        if not changed:
+            backend.state = replace(backend.state, icons=(replace(backend.state.icons[0], position=Point(0, 300)),) + backend.state.icons[1:])
+            changed = True
+    monkeypatch.setattr(engine._store, "save_layouts", mutate_after_flush)
+    assert engine.organize(plan).errors
+    assert not backend.calls
+
+
+def test_auto_arrange_allows_read_and_save_but_blocks_positioning(prepared):
+    engine, backend = prepared
+    backend.state = replace(backend.state, auto_arrange=True)
+    plan = engine.preview()
+    assert plan.warnings
+    saved = engine.save_layout("自动排列时保存")
+    assert saved["auto_arrange"]
+    assert engine.organize(plan).errors and not backend.calls
+
+
+def test_pinned_icons_and_ignore_patterns_stay_at_current_positions(prepared):
+    engine, backend = prepared
+    original = positions(backend.state)
+    engine.save_settings(Settings(pinned_ids=["folder-id"], ignored_patterns=["讲义.*"]))
+    plan = engine.preview()
+    assert not engine.organize(plan).errors
+    assert positions(backend.state)["folder-id"] == original["folder-id"]
+    assert positions(backend.state)["file-id"] == original["file-id"]
+
+
+def test_restore_matches_stable_id_after_rename_and_ignores_removed_icons(prepared):
+    engine, backend = prepared
+    original = positions(backend.state)
+    snapshot = engine.save_layout()
+    engine.organize(engine.preview())
+    backend.state = replace(backend.state, icons=tuple(replace(icon, name="renamed", parsing_name="renamed") if icon.identity == "folder-id" else icon for icon in backend.state.icons if icon.identity != "recycle-id"))
+    plan = engine.restore_preview(snapshot["id"])
+    assert any("不存在" in warning for warning in plan.warnings)
+    assert not engine.organize(plan).errors
+    assert positions(backend.state)["folder-id"] == original["folder-id"]
+    assert "recycle-id" not in positions(backend.state)
+
+
+def test_restore_remaps_disconnected_monitor_and_keeps_new_icons(prepared):
+    engine, backend = prepared
+    snapshot = engine.save_layout()
+    backend.state = replace(backend.state, monitors=(Monitor("replacement", Rect(-800, 0, 0, 600), 144),), icons=tuple(replace(icon, position=Point(-800 + index * 100, 200)) for index, icon in enumerate(backend.state.icons)) + (Icon("new-id", "new", "new", Point(-100, 400)),))
+    plan = engine.restore_preview(snapshot["id"])
+    assert any("显示器" in warning for warning in plan.warnings)
+    assert not engine.organize(plan).errors
+    assert positions(backend.state)["new-id"] == Point(-100, 400)
+    assert all(backend.state.monitors[0].work_area.contains(icon.position, backend.state.spacing) for icon in backend.state.icons)
+
+
+def test_operation_lock_blocks_second_instance(prepared):
+    engine, backend = prepared
+    second = Engine(backend, engine.data_dir)
+    plan = second.preview()
     with engine._lock():
-        result = second.organize(second.preview())
-    assert result.moved_count == 0 and result.errors
+        result = second.organize(plan)
+    assert result.errors and not backend.calls
 
 
-def test_reject_output_symlink(engine, tmp_path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    try:
-        (engine.desktop / OUTPUT_FOLDER).symlink_to(outside, target_is_directory=True)
-    except OSError:
-        pytest.skip("symbolic links unavailable")
-    source = write(engine, "a.txt")
-    with pytest.raises(ValueError, match="目录不安全"):
-        engine.preview()
-    assert source.exists() and not list(outside.iterdir())
+def test_no_changes_is_no_native_call_or_automatic_snapshot(prepared):
+    engine, backend = prepared
+    assert not engine.organize(engine.preview()).errors
+    count = len(engine.history())
+    backend.calls.clear()
+    result = engine.organize(engine.preview())
+    assert not result.errors and result.changed_count == 0 and not backend.calls
+    assert len(engine.history()) == count
 
 
-def test_history_path_tampering_cannot_move_outside_desktop(engine, tmp_path):
-    write(engine, "a.txt")
+def test_error_backend_cannot_trigger_any_file_operation(prepared, monkeypatch, tmp_path):
+    engine, backend = prepared
+    user_dir = tmp_path / "user-files"
+    user_dir.mkdir()
+    user_file = user_dir / "document.txt"
+    user_file.write_bytes(b"must not change")
+    backend.state = replace(backend.state, icons=tuple(replace(icon, parsing_name=str(user_file)) for icon in backend.state.icons))
+    def fail(mapping):
+        raise RuntimeError("native unavailable")
+    monkeypatch.setattr(backend, "position", fail)
+    result = engine.organize(engine.preview())
+    assert result.errors
+    assert list(user_dir.iterdir()) == [user_file]
+    assert user_file.read_bytes() == b"must not change"
+
+
+def test_backend_read_exception_is_friendly_operation_error(prepared, monkeypatch):
+    engine, backend = prepared
     plan = engine.preview()
-    engine.organize(plan)
-    history = engine._store.load_history()
-    history[-1]["entries"][0]["source"] = str(tmp_path / "outside.txt")
-    engine._store.save_history(history)
-    result = engine.undo()
-    assert result.errors and result.moved_count == 0
-    assert not (tmp_path / "outside.txt").exists()
-    assert plan[0].destination.exists()
+    monkeypatch.setattr(backend, "read", lambda: (_ for _ in ()).throw(RuntimeError("Explorer unavailable")))
+    result = engine.organize(plan)
+    assert result.errors and not backend.calls
 
 
-def test_missing_desktop_does_not_get_created_implicitly(tmp_path):
-    missing = tmp_path / "does-not-exist"
-    engine = Engine(missing, tmp_path / "state")
-    with pytest.raises(FileNotFoundError):
+def test_duplicate_identity_is_rejected_before_preview(prepared):
+    engine, backend = prepared
+    backend.state = replace(backend.state, icons=(backend.state.icons[0], backend.state.icons[0]))
+    with pytest.raises(ValueError, match="重复"):
         engine.scan()
-    assert not missing.exists()
+    assert not backend.calls
+
+
+def test_invalid_saved_layout_id_has_clear_error(prepared):
+    engine, backend = prepared
+    with pytest.raises(ValueError, match="未找到"):
+        engine.restore_preview("missing")
+    assert engine.restore_layout("missing").errors and not backend.calls

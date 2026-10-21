@@ -9,8 +9,8 @@ import argparse
 
 def main() -> int:
     """Start Qt and display a useful error if startup cannot complete."""
-    parser = argparse.ArgumentParser(description="DesktopPilot 桌面整理助手")
-    parser.add_argument("--smoke-test", metavar="REPORT_JSON", help="在临时目录运行打包自检并写入 JSON 报告")
+    parser = argparse.ArgumentParser(description="DesktopPilot 桌面图标排列控制中心")
+    parser.add_argument("--smoke-test", metavar="REPORT_JSON", help="使用模拟图标验证打包，不访问真实桌面")
     options = parser.parse_args()
     if options.smoke_test:
         # This path never discovers or touches the user's actual desktop.
@@ -22,7 +22,7 @@ def main() -> int:
         import ctypes
 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "DesktopPilot.DesktopPilot.0.1"
+            "DesktopPilot.DesktopPilot.0.2"
         )
 
     from PySide6.QtGui import QFont
@@ -30,7 +30,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("DesktopPilot")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationVersion("0.2.0")
     app.setOrganizationName("DesktopPilot")
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI" if os.name == "nt" else "Noto Sans", 10))
@@ -44,7 +44,7 @@ def main() -> int:
         QMessageBox.critical(
             None,
             "DesktopPilot 无法启动",
-            f"无法初始化桌面或本地设置。请确认桌面路径可访问。\n\n{exc}",
+            f"无法初始化桌面图标控制中心或本地设置。\n\n{exc}",
         )
         return 1
 

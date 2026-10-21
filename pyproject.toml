@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "desktop-pilot"
-version = "0.1.0"
-description = "A safe, preview-first Windows desktop organizer built with PySide6"
+version = "0.2.0"
+description = "A preview-first Windows Explorer desktop icon layout organizer"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["PySide6==6.8.3"]
@@ -24,7 +24,7 @@ where = ["."]
 include = ["desktop_pilot*"]
 
 [tool.setuptools.package-data]
-desktop_pilot = ["assets/*.png", "assets/*.ico"]
+desktop_pilot = ["assets/*.png", "assets/*.ico", "native/*.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

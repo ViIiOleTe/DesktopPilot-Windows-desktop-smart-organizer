@@ -1,14 +1,16 @@
-"""DesktopPilot's Qt interface. File operations are delegated to the safe core."""
+"""Desktop icon control center; only the Shell backend changes icon positions."""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -35,7 +38,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .core import CATEGORY_NAMES, Engine, Settings
+from .core import Engine
+from .models import CATEGORY_LABELS, LayoutItem, Settings
 
 
 class _JobThread(QThread):
@@ -110,8 +114,94 @@ def _card() -> QFrame:
     return frame
 
 
+class DesktopCanvas(QWidget):
+    """Scaled virtual-monitor map. Rendering never opens an icon's target."""
+
+    COLORS = {"folder": "#e8bd7a", "software": "#8db8ff", "game": "#b5a1fa", "file": "#6ed5bc", "system": "#c0ccdc"}
+
+    def __init__(self, proposed: bool = False):
+        super().__init__()
+        self.state: Any = None
+        self.plan: Any = None
+        self.proposed = proposed
+        self.dark = True
+        self.setMinimumHeight(220)
+        self.setMouseTracking(True)
+        self._hits: list[tuple[QRectF, str]] = []
+
+    def set_layout(self, state: Any, plan: Any = None) -> None:
+        self.state, self.plan = state, plan
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#97a6bd" if self.dark else "#63738b"))
+        if self.state is None or not self.state.monitors:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "扫描 Windows 桌面视图后，在这里查看图标布局")
+            return
+        areas = [monitor.work_area for monitor in self.state.monitors]
+        left, top = min(a.left for a in areas), min(a.top for a in areas)
+        right, bottom = max(a.right for a in areas), max(a.bottom for a in areas)
+        scale = min((self.width() - 48) / max(1, right - left), (self.height() - 48) / max(1, bottom - top))
+        offset_x = (self.width() - (right - left) * scale) / 2
+        offset_y = (self.height() - (bottom - top) * scale) / 2
+
+        def point(position: Any) -> QPointF:
+            return QPointF(offset_x + (position.x - left) * scale, offset_y + (position.y - top) * scale)
+
+        for monitor in self.state.monitors:
+            area = monitor.work_area
+            rect = QRectF(offset_x + (area.left - left) * scale, offset_y + (area.top - top) * scale, area.width * scale, area.height * scale)
+            painter.setPen(QPen(QColor("#496288" if self.dark else "#9db5d8"), 1))
+            painter.setBrush(QColor("#131d2d" if self.dark else "#edf3fc"))
+            painter.drawRoundedRect(rect, 8, 8)
+            painter.setPen(QColor("#7890b2" if self.dark else "#607697"))
+            painter.setFont(QFont(self.font().family(), 8))
+            painter.drawText(rect.adjusted(9, 5, -6, -5), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight, f"{monitor.id} · {area.width}×{area.height} · {monitor.dpi} DPI")
+        plan_items = {item.identity: item for item in self.plan.items} if self.plan is not None else {}
+        self._hits = []
+        for icon in self.state.icons:
+            item = plan_items.get(icon.identity)
+            current = point(icon.position)
+            proposed = point(item.destination) if self.proposed and item is not None else current
+            color = QColor(self.COLORS.get(item.category if item else icon.category, "#8db8ff"))
+            if self.proposed and item is not None and item.source != item.destination:
+                painter.setPen(QPen(QColor("#6b83a5"), 1, Qt.PenStyle.DashLine))
+                painter.drawLine(current, proposed)
+                delta_x, delta_y = proposed.x() - current.x(), proposed.y() - current.y()
+                length = math.hypot(delta_x, delta_y)
+                if length > 12:
+                    ux, uy = delta_x / length, delta_y / length
+                    painter.drawLine(proposed, QPointF(proposed.x() - 7 * ux + 3 * uy, proposed.y() - 7 * uy - 3 * ux))
+                    painter.drawLine(proposed, QPointF(proposed.x() - 7 * ux - 3 * uy, proposed.y() - 7 * uy + 3 * ux))
+                painter.setPen(QPen(QColor("#6b83a5"), 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(current, 3, 3)
+            size = max(7.0, min(16.0, self.state.icon_size * scale))
+            icon_rect = QRectF(proposed.x() - size / 2, proposed.y() - size / 2, size, size)
+            painter.setPen(QPen(QColor("#ffd17e"), 2) if item is not None and item.pinned else QPen(color, 1))
+            painter.setBrush(color)
+            painter.drawRoundedRect(icon_rect, 3, 3)
+            painter.setPen(QColor("#dbe6f7" if self.dark else "#31425f"))
+            painter.setFont(QFont(self.font().family(), 7))
+            label_rect = QRectF(proposed.x() - 35, proposed.y() + size / 2 + 2, 70, 14)
+            label = icon.name if len(icon.name) <= 10 else icon.name[:9] + "…"
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter, label)
+            tooltip = f"{icon.name}\n当前坐标：({icon.position.x}, {icon.position.y})"
+            if item is not None:
+                tooltip += f"\n预览坐标：({item.destination.x}, {item.destination.y})"
+                if item.pinned:
+                    tooltip += "\n已固定位置"
+            self._hits.append((icon_rect.adjusted(-6, -6, 6, 20), tooltip))
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        self.setToolTip(next((text for rect, text in reversed(self._hits) if rect.contains(event.position())), ""))
+        super().mouseMoveEvent(event)
+
+
 class MainWindow(QMainWindow):
-    """The main application window; injected engines make GUI tests safe."""
+    """Modern UI for scanning and arranging Windows Shell icon coordinates."""
 
     operation_finished = Signal()
 
@@ -119,22 +209,25 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.engine = engine if engine is not None else Engine()
         self._thread: _JobThread | None = None
-        self._plan: list[Any] = []
+        self._plan: Any = None
+        self._plan_error = ""
+        self._state: Any = None
         self._scan: Any = None
         self._history: list[dict[str, Any]] = []
+        self._saved_layouts: list[dict[str, Any]] = []
         self._has_snapshot = False
         self._job_callback: Callable[[Any], None] | None = None
         self._busy_controls: list[QWidget] = []
-        self.setWindowTitle("DesktopPilot · 智能桌面整理助手")
+        self.setWindowTitle("DesktopPilot · 桌面图标控制中心")
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "icon.png")))
-        # Fit the screen in logical pixels, including high-DPI Windows displays.
         available = self.screen().availableGeometry()
         self.setMinimumSize(min(900, available.width()), min(600, available.height()))
-        self.resize(min(1280, available.width()), min(850, available.height()))
+        self.resize(min(1280, available.width()), min(880, available.height()))
         self.setFont(QFont("Segoe UI", 10))
         self._build_ui()
         self._load_settings_fields()
         self._apply_theme(self.engine.settings.theme)
+        self._update_action_states()
         QTimer.singleShot(0, self.rescan)
 
     @property
@@ -161,16 +254,12 @@ class MainWindow(QMainWindow):
         brand.addWidget(mark)
         brand.addWidget(_label("DesktopPilot", "brand"))
         side.addLayout(brand)
-        side.addWidget(_label("让桌面，回归井然有序", "muted"))
-        side.addSpacing(34)
-        side.addWidget(_label("工作空间", "eyebrow"))
-        side.addSpacing(4)
+        side.addWidget(_label("桌面图标，井然有序", "muted"))
+        side.addSpacing(30)
+        side.addWidget(_label("图标控制中心", "eyebrow"))
         self.nav_buttons: list[QPushButton] = []
         group = QButtonGroup(self)
-        group.setExclusive(True)
-        for index, (icon, title) in enumerate([
-            ("▦", "桌面概览"), ("≡", "整理预览"), ("↶", "整理历史"), ("⚙", "软件设置"),
-        ]):
+        for index, (icon, title) in enumerate([("▦", "桌面概览"), ("≡", "排列预览"), ("↶", "布局与历史"), ("⚙", "排列设置")]):
             button = _button(f"{icon}    {title}", "nav")
             button.setCheckable(True)
             button.setMinimumHeight(46)
@@ -184,17 +273,16 @@ class MainWindow(QMainWindow):
         safety.setProperty("kind", "safety")
         safety_layout = QVBoxLayout(safety)
         safety_layout.setContentsMargins(14, 14, 14, 14)
-        safety_layout.addWidget(_label("✓  文件安全优先", "smallTitle"))
-        safety_layout.addWidget(_label("先预览，再整理。\n不覆盖文件，支持撤销。", "muted", True))
+        safety_layout.addWidget(_label("✓  只调整图标坐标", "smallTitle"))
+        safety_layout.addWidget(_label("先预览，再排列。\n保留文件位置与内容。", "muted", True))
         side.addWidget(safety)
         side.addSpacing(8)
         side.addWidget(_label(f"DESKTOPPILOT  /  {__version__}", "eyebrow"))
         outer.addWidget(sidebar)
-
         workspace = QWidget()
         layout = QVBoxLayout(workspace)
         layout.setContentsMargins(30, 24, 30, 20)
-        layout.setSpacing(18)
+        layout.setSpacing(14)
         top = QHBoxLayout()
         self.page_title = _label("桌面概览", "pageTitle")
         top.addWidget(self.page_title)
@@ -202,27 +290,27 @@ class MainWindow(QMainWindow):
         self.status_chip = _label("●  正在准备", "chip")
         top.addWidget(self.status_chip)
         layout.addLayout(top)
-        self.desktop_label = _label(f"桌面位置  {self.engine.desktop}", "muted", True)
-        self.desktop_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.desktop_label = _label("Windows Shell 桌面视图 · 多显示器坐标布局", "muted", True)
         layout.addWidget(self.desktop_label)
+        self.auto_arrange_warning = _label("", "muted", True)
+        self.auto_arrange_warning.setStyleSheet("color: #d79b40; padding: 10px; background: rgba(200,140,40,0.1); border-radius: 7px;")
+        self.auto_arrange_warning.hide()
+        layout.addWidget(self.auto_arrange_warning)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._dashboard_page())
         self.pages.addWidget(self._preview_page())
         self.pages.addWidget(self._history_page())
         self.pages.addWidget(self._settings_page())
         layout.addWidget(self.pages, 1)
-        bottom = QHBoxLayout()
-        self.status_label = _label("正在读取桌面…", "muted")
-        self.status_label.setWordWrap(True)
-        bottom.addWidget(self.status_label, 1)
+        footer = QHBoxLayout()
+        self.status_label = _label("正在连接 Windows 桌面视图…", "muted", True)
+        footer.addWidget(self.status_label, 1)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setFixedWidth(160)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        bottom.addWidget(self.progress_bar)
-        layout.addLayout(bottom)
+        self.progress_bar.hide()
+        footer.addWidget(self.progress_bar)
+        layout.addLayout(footer)
         outer.addWidget(workspace, 1)
 
     def _dashboard_page(self) -> QWidget:
@@ -230,99 +318,69 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         page = QWidget()
-        page.setMinimumHeight(660)
+        page.setMinimumHeight(710)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(20)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(16)
         hero = QFrame()
         hero.setObjectName("hero")
-        hero.setMinimumHeight(172)
+        hero.setMinimumHeight(132)
         hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(28, 20, 20, 20)
+        hero_layout.setContentsMargins(24, 14, 18, 14)
         copy = QVBoxLayout()
-        copy.addWidget(_label("A CLEAR DESK. A CLEAR MIND.", "heroEyebrow"))
-        copy.addWidget(_label("桌面清爽一点，\n专注多一点。", "heroTitle"))
-        copy.addWidget(_label("智能分类散落的文件与快捷方式，整理从一次预览开始。", "heroDescription", True))
+        copy.addWidget(_label("YOUR DESKTOP. PERFECTLY ALIGNED.", "heroEyebrow"))
+        copy.addWidget(_label("让图标各就其位。", "heroTitle"))
+        copy.addWidget(_label("分类排列桌面图标，保存熟悉的布局，一键找回秩序。", "heroDescription", True))
         hero_layout.addLayout(copy, 1)
-        hero_layout.addWidget(_Orbit())
+        illustration = _Orbit()
+        illustration.setFixedHeight(110)
+        hero_layout.addWidget(illustration)
         layout.addWidget(hero)
-
-        stats = QHBoxLayout()
-        stats.setSpacing(14)
+        stats = QGridLayout()
+        stats.setSpacing(12)
         self.stat_values: dict[str, QLabel] = {}
-        for key, title, footer, accent in [
-            ("files", "桌面文件", "本次扫描识别", "blue"),
-            ("shortcuts", "应用快捷方式", "只整理链接文件", "purple"),
-            ("categories", "文件分类", "按格式自动归类", "teal"),
-            ("ignored", "已安全忽略", "文件夹 / 系统对象等", "amber"),
-        ]:
+        for index, (key, title) in enumerate([("icons", "桌面图标总数"), *CATEGORY_LABELS.items()]):
             frame = _card()
-            frame.setMinimumHeight(126)
-            box = QVBoxLayout(frame)
-            box.setContentsMargins(18, 17, 18, 17)
-            box.setSpacing(8)
-            box.addWidget(_label(title, "muted"))
+            frame.setMinimumHeight(80)
+            box = QHBoxLayout(frame)
+            box.setContentsMargins(16, 12, 16, 12)
+            box.addWidget(_label(title, "muted"), 1)
             value = _label("—", "stat")
-            value.setProperty("accent", accent)
+            value.setProperty("accent", {"folder": "amber", "game": "purple", "file": "teal"}.get(key, "blue"))
             self.stat_values[key] = value
             box.addWidget(value)
-            box.addWidget(_label(footer, "tiny"))
-            stats.addWidget(frame, 1)
+            stats.addWidget(frame, index // 3, index % 3)
         layout.addLayout(stats)
-
         frame = _card()
-        frame.setMinimumHeight(254)
-        categories = QVBoxLayout(frame)
-        categories.setContentsMargins(22, 18, 22, 18)
+        frame.setMinimumHeight(280)
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(18, 14, 18, 12)
         heading = QHBoxLayout()
-        heading.addWidget(_label("分类一览", "sectionTitle"))
+        heading.addWidget(_label("当前桌面布局", "sectionTitle"))
         heading.addStretch()
-        heading.addWidget(_label("DESKTOP INSIGHTS", "eyebrow"))
-        categories.addLayout(heading)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(24)
-        grid.setVerticalSpacing(12)
-        self.category_labels: dict[str, QLabel] = {}
-        self.category_bars: dict[str, QProgressBar] = {}
-        for index, category in enumerate(CATEGORY_NAMES):
-            row = QVBoxLayout()
-            row.setSpacing(6)
-            text_row = QHBoxLayout()
-            text_row.addWidget(_label(category))
-            text_row.addStretch()
-            count = _label("0", "muted")
-            self.category_labels[category] = count
-            text_row.addWidget(count)
-            row.addLayout(text_row)
-            bar = QProgressBar()
-            bar.setTextVisible(False)
-            bar.setRange(0, 100)
-            bar.setValue(0)
-            bar.setFixedHeight(5)
-            self.category_bars[category] = bar
-            row.addWidget(bar)
-            grid.addLayout(row, index // 2, index % 2)
-        categories.addSpacing(8)
-        categories.addLayout(grid)
-        categories.addSpacing(8)
-        self.file_type_summary = _label("文件类型统计将在扫描完成后显示", "tiny", True)
-        categories.addWidget(self.file_type_summary)
+        self.monitor_summary = _label("等待扫描", "eyebrow")
+        heading.addWidget(self.monitor_summary)
+        box.addLayout(heading)
+        self.current_canvas = DesktopCanvas()
+        box.addWidget(self.current_canvas, 1)
+        box.addWidget(_label("悬停图标查看名称与坐标 · 显示器使用实际工作区比例", "tiny"))
         layout.addWidget(frame, 1)
         actions = QHBoxLayout()
         self.scan_button = _button("↻  重新扫描")
         self.scan_button.clicked.connect(self.rescan)
-        self.undo_button = _button("↶  撤销上次整理")
+        self.save_layout_button = _button("◇  保存当前布局")
+        self.save_layout_button.clicked.connect(self.save_current_layout)
+        self.undo_button = _button("↶  一键撤销")
         self.undo_button.clicked.connect(self.request_undo)
-        self.organize_button = _button("一键整理  →", "primary")
-        self.organize_button.setMinimumHeight(48)
-        self.organize_button.setMinimumWidth(205)
-        self.organize_button.clicked.connect(lambda: self._show_page(1))
-        actions.addWidget(self.scan_button)
-        actions.addWidget(self.undo_button)
+        self.organize_button = _button("智能排列  →", "primary")
+        self.organize_button.setMinimumHeight(46)
+        self.organize_button.clicked.connect(self.show_arrange_preview)
+        for button in [self.scan_button, self.save_layout_button, self.undo_button]:
+            actions.addWidget(button)
         actions.addStretch()
         actions.addWidget(self.organize_button)
         layout.addLayout(actions)
-        self._busy_controls.extend([self.scan_button, self.undo_button, self.organize_button])
+        self._busy_controls.extend([self.scan_button, self.save_layout_button, self.undo_button, self.organize_button])
         scroll.setWidget(page)
         return scroll
 
@@ -330,75 +388,72 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-        hint = _card()
-        hint_layout = QVBoxLayout(hint)
-        hint_layout.setContentsMargins(20, 16, 20, 16)
-        hint_layout.addWidget(_label("确认每一次移动", "sectionTitle"))
-        hint_layout.addWidget(_label(
-            "文件将分类到桌面的“DesktopPilot整理”文件夹。取消勾选可保留文件；同名文件会使用新名称。确认后才开始移动。",
-            "muted", True))
-        layout.addWidget(hint)
-        tools = QHBoxLayout()
-        self.preview_summary = _label("正在生成预览…", "smallTitle")
-        tools.addWidget(self.preview_summary, 1)
-        self.select_all_button = _button("全选", "quiet")
-        self.clear_selection_button = _button("取消全选", "quiet")
-        self.select_all_button.clicked.connect(lambda: self._select_all(True))
-        self.clear_selection_button.clicked.connect(lambda: self._select_all(False))
-        tools.addWidget(self.select_all_button)
-        tools.addWidget(self.clear_selection_button)
-        layout.addLayout(tools)
-        self.preview_table = self._table(["移动", "文件名", "分类", "原位置", "目标位置"])
-        self.preview_table.setColumnWidth(0, 52)
-        self.preview_table.setColumnWidth(1, 170)
-        self.preview_table.setColumnWidth(2, 110)
+        layout.setSpacing(12)
+        self.preview_summary = _label("扫描后可预览图标排列", "sectionTitle")
+        layout.addWidget(self.preview_summary)
+        self.plan_warnings = _label("", "muted", True)
+        self.plan_warnings.hide()
+        layout.addWidget(self.plan_warnings)
+        self.preview_canvas = DesktopCanvas(proposed=True)
+        self.preview_canvas.setMinimumHeight(160)
+        layout.addWidget(self.preview_canvas, 1)
+        layout.addWidget(_label("虚线箭头：当前坐标 → 预览坐标 · 金色边框：保持当前位置", "tiny"))
+        self.preview_table = self._table(["固定位置", "图标名称", "分类", "当前坐标", "预览坐标"])
+        self.preview_table.setMinimumHeight(140)
+        self.preview_table.setColumnWidth(0, 75)
+        self.preview_table.setColumnWidth(1, 190)
+        self.preview_table.setColumnWidth(2, 130)
         self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.preview_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.preview_table.itemChanged.connect(self._selection_changed)
+        self.preview_table.itemChanged.connect(self._icon_rules_edited)
         layout.addWidget(self.preview_table, 1)
-        self.preview_empty = _label("桌面已经很整洁，暂无待整理文件。", "muted")
-        self.preview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.preview_empty)
-        footer = QHBoxLayout()
-        footer.addWidget(_label("✓  不删除文件   ·   不覆盖文件   ·   支持撤销", "muted"), 1)
-        self.confirm_button = _button("确认并开始整理", "primary")
-        self.confirm_button.setMinimumHeight(46)
-        self.confirm_button.setMinimumWidth(190)
+        tools = QHBoxLayout()
+        self.save_icon_rules_button = _button("保存固定 / 分类规则并重新预览")
+        self.save_icon_rules_button.clicked.connect(self.save_icon_rules)
+        tools.addWidget(self.save_icon_rules_button)
+        tools.addStretch()
+        self.confirm_button = _button("确认并应用排列", "primary")
+        self.confirm_button.setMinimumHeight(44)
         self.confirm_button.clicked.connect(self.request_organize)
-        footer.addWidget(self.confirm_button)
-        layout.addLayout(footer)
-        self._busy_controls.extend([
-            self.confirm_button, self.select_all_button, self.clear_selection_button,
-            self.preview_table,
-        ])
+        tools.addWidget(self.confirm_button)
+        layout.addLayout(tools)
+        self._busy_controls.extend([self.preview_table, self.save_icon_rules_button, self.confirm_button])
         return page
 
     def _history_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-        intro = QHBoxLayout()
-        copy = QVBoxLayout()
-        copy.addWidget(_label("每一次整理，都有迹可循", "sectionTitle"))
-        copy.addWidget(_label("保留文件移动记录；撤销时若原位置有同名文件，会保留现有文件并提示。", "muted", True))
-        intro.addLayout(copy, 1)
-        self.history_undo_button = _button("↶  撤销上次整理")
-        self.history_undo_button.clicked.connect(self.request_undo)
-        intro.addWidget(self.history_undo_button)
-        layout.addLayout(intro)
-        self.history_table = self._table(["整理时间", "状态", "文件", "原位置", "整理后位置"])
-        self.history_table.setColumnWidth(0, 150)
-        self.history_table.setColumnWidth(1, 90)
-        self.history_table.setColumnWidth(2, 150)
-        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        layout.setSpacing(14)
+        layout.addWidget(_label("保存布局，随时回到熟悉的位置", "sectionTitle"))
+        layout.addWidget(_label("自动保留操作前的图标坐标；手动布局可重复恢复。已消失的图标不会重新创建。", "muted", True))
+        tools = QHBoxLayout()
+        self.saved_layouts_combo = QComboBox()
+        self.saved_layouts_combo.setMinimumWidth(200)
+        self.saved_layouts_combo.currentIndexChanged.connect(self._update_action_states)
+        tools.addWidget(self.saved_layouts_combo, 1)
+        self.restore_layout_button = _button("预览恢复布局", "primary")
+        self.restore_layout_button.clicked.connect(self.restore_layout_preview)
+        tools.addWidget(self.restore_layout_button)
+        self.history_save_button = _button("保存当前布局")
+        self.history_save_button.clicked.connect(self.save_current_layout)
+        tools.addWidget(self.history_save_button)
+        layout.addLayout(tools)
+        self.history_table = self._table(["布局名称", "保存时间", "类型", "图标数", "状态"])
+        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.history_table.setColumnWidth(1, 160)
+        self.history_table.setColumnWidth(2, 125)
+        self.history_table.setColumnWidth(3, 70)
+        self.history_table.setColumnWidth(4, 100)
+        self.history_table.itemSelectionChanged.connect(self._select_history_layout)
         layout.addWidget(self.history_table, 1)
-        self.history_empty = _label("还没有整理记录。完成第一次整理后，会在这里记录每个文件的去向。", "muted", True)
+        self.history_empty = _label("暂无已保存的布局。点击“保存当前布局”记录桌面图标位置。", "muted", True)
         self.history_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.history_empty)
-        self._busy_controls.append(self.history_undo_button)
+        self.history_undo_button = _button("↶  撤销上次坐标调整")
+        self.history_undo_button.clicked.connect(self.request_undo)
+        layout.addWidget(self.history_undo_button, 0, Qt.AlignmentFlag.AlignRight)
+        self._busy_controls.extend([self.saved_layouts_combo, self.restore_layout_button, self.history_save_button, self.history_undo_button])
         return page
 
     def _settings_page(self) -> QWidget:
@@ -408,60 +463,53 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(14)
         appearance = _card()
         box = QVBoxLayout(appearance)
-        box.setContentsMargins(22, 20, 22, 20)
-        box.addWidget(_label("外观", "sectionTitle"))
-        row = QHBoxLayout()
-        row.addWidget(_label("选择你喜欢的工作空间主题", "muted"), 1)
+        box.setContentsMargins(22, 18, 22, 18)
+        box.addWidget(_label("工作空间外观", "sectionTitle"))
         self.theme_combo = QComboBox()
         self.theme_combo.addItem("深色 · Midnight", "dark")
         self.theme_combo.addItem("浅色 · Daylight", "light")
-        self.theme_combo.setMinimumWidth(180)
-        row.addWidget(self.theme_combo)
-        box.addLayout(row)
+        box.addWidget(self.theme_combo)
         layout.addWidget(appearance)
-
-        exclusions = _card()
-        box = QVBoxLayout(exclusions)
-        box.setContentsMargins(22, 20, 22, 20)
-        box.setSpacing(9)
-        box.addWidget(_label("自定义忽略列表", "sectionTitle"))
-        box.addWidget(_label("每行一个文件名或通配符。例如 *.tmp、工作计划.docx。匹配忽略大小写。", "muted", True))
-        self.ignore_edit = QPlainTextEdit()
-        self.ignore_edit.setPlaceholderText("*.tmp\n保留的文件.txt")
-        self.ignore_edit.setMinimumHeight(100)
-        self.ignore_edit.setMaximumHeight(135)
-        box.addWidget(self.ignore_edit)
-        layout.addWidget(exclusions)
-
-        shortcuts = _card()
-        box = QVBoxLayout(shortcuts)
-        box.setContentsMargins(22, 20, 22, 20)
-        box.setSpacing(9)
-        box.addWidget(_label("保留常用快捷方式", "sectionTitle"))
-        box.addWidget(_label("每行一个快捷方式文件名，包含 .lnk 或 .url 后缀。例如 微信.lnk。这些快捷方式会留在桌面。", "muted", True))
-        self.keep_edit = QPlainTextEdit()
-        self.keep_edit.setPlaceholderText("微信.lnk\n浏览器.lnk")
-        self.keep_edit.setMinimumHeight(85)
-        self.keep_edit.setMaximumHeight(115)
-        box.addWidget(self.keep_edit)
-        layout.addWidget(shortcuts)
-        layout.addWidget(_label(
-            "安全规则始终启用：跳过文件夹、隐藏及系统对象、符号链接、程序本体和本程序的整理目录。快捷方式只移动链接本身。",
-            "muted", True))
+        arrangement = _card()
+        box = QVBoxLayout(arrangement)
+        box.setContentsMargins(22, 18, 22, 18)
+        box.addWidget(_label("分类顺序与排列方式", "sectionTitle"))
+        box.addWidget(_label("每行一个分类，调整行的顺序即可改变排列次序。须包含全部五个分类。", "muted", True))
+        self.category_order_edit = QPlainTextEdit()
+        self.category_order_edit.setFixedHeight(115)
+        box.addWidget(self.category_order_edit)
         row = QHBoxLayout()
-        row.addStretch()
-        self.save_settings_button = _button("保存设置并重新扫描", "primary")
+        row.addWidget(_label("排列方向", "muted"))
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItem("按列 · 从上到下", "column")
+        self.direction_combo.addItem("按行 · 从左到右", "row")
+        row.addWidget(self.direction_combo, 1)
+        row.addWidget(_label("分类间隔（网格）", "muted"))
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(0, 10)
+        row.addWidget(self.gap_spin)
+        box.addLayout(row)
+        layout.addWidget(arrangement)
+        games = _card()
+        box = QVBoxLayout(games)
+        box.setContentsMargins(22, 18, 22, 18)
+        box.addWidget(_label("游戏识别规则", "sectionTitle"))
+        box.addWidget(_label("每行一个名称、目标或启动参数的通配符。例如 steam://*、*\\steamapps\\*。可在排列预览中手动覆盖分类。", "muted", True))
+        self.game_rules_edit = QPlainTextEdit()
+        self.game_rules_edit.setMinimumHeight(90)
+        self.game_rules_edit.setMaximumHeight(125)
+        box.addWidget(self.game_rules_edit)
+        layout.addWidget(games)
+        layout.addWidget(_label("在“排列预览”勾选固定位置可保留常用图标；修改图标分类后，需保存规则并重新预览。排列前请关闭 Windows 的“自动排列图标”。", "muted", True))
+        self.save_settings_button = _button("保存设置并重新预览", "primary")
         self.save_settings_button.clicked.connect(self.save_settings)
-        row.addWidget(self.save_settings_button)
-        layout.addLayout(row)
+        layout.addWidget(self.save_settings_button, 0, Qt.AlignmentFlag.AlignRight)
         layout.addStretch()
         scroll.setWidget(page)
-        self._busy_controls.extend([
-            self.theme_combo, self.ignore_edit, self.keep_edit, self.save_settings_button,
-        ])
+        self._busy_controls.extend([self.theme_combo, self.category_order_edit, self.direction_combo, self.gap_spin, self.game_rules_edit, self.save_settings_button])
         return scroll
 
     @staticmethod
@@ -469,7 +517,7 @@ class MainWindow(QMainWindow):
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(48)
+        table.verticalHeader().setDefaultSectionSize(44)
         table.setShowGrid(False)
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -478,22 +526,27 @@ class MainWindow(QMainWindow):
         table.setWordWrap(False)
         table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         table.horizontalHeader().setHighlightSections(False)
-        table.horizontalHeader().setMinimumSectionSize(48)
         return table
 
     @Slot(int)
     def _show_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
         self.nav_buttons[index].setChecked(True)
-        self.page_title.setText(["桌面概览", "整理预览", "整理历史", "软件设置"][index])
+        self.page_title.setText(["桌面概览", "排列预览", "布局与历史", "排列设置"][index])
 
     def _snapshot(self) -> dict[str, Any]:
-        scan = self.engine.scan()
-        return {"scan": scan, "plan": self.engine.preview(scan), "history": self.engine.history()}
+        state = self.engine.scan()
+        try:
+            plan, plan_error = self.engine.preview(state), ""
+        except ValueError as exc:
+            # A full grid prevents arranging, but scanning and saving the
+            # existing layout remain useful and safe. Pins can still be edited.
+            plan, plan_error = None, str(exc)
+        return {"state": state, "plan": plan, "plan_error": plan_error, "layouts": self.engine.saved_layouts(), "history": self.engine.history()}
 
     @Slot()
     def rescan(self) -> None:
-        self._start_job(lambda progress: self._snapshot(), self._render_snapshot, "正在扫描桌面并生成安全预览…")
+        self._start_job(lambda progress: self._snapshot(), self._render_snapshot, "正在读取 Windows Shell 桌面图标与显示器坐标…")
 
     def _start_job(self, operation: Callable[..., Any], on_success: Callable[[Any], None], message: str) -> None:
         if self.busy:
@@ -520,9 +573,10 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _job_failed(self, error: str) -> None:
-        self.status_label.setText("操作未完成，请查看提示后重试。")
+        self._plan = None
+        self.status_label.setText("Windows 桌面操作未完成，请查看提示。")
         self.status_chip.setText("●  需要关注")
-        QMessageBox.warning(self, "操作未完成", f"DesktopPilot 无法完成此次操作：\n\n{error}\n\n请检查文件权限及桌面位置后重新扫描。")
+        QMessageBox.warning(self, "桌面视图操作未完成", f"{error}\n\nDesktopPilot 需要 Windows 10/11 的 Explorer 桌面视图。请确认 Explorer 正常运行；本程序不会改用文件目录扫描或文件移动。")
 
     @Slot()
     def _job_ended(self) -> None:
@@ -545,196 +599,289 @@ class MainWindow(QMainWindow):
     def _progress(self, current: int, total: int) -> None:
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(current)
-        self.status_label.setText(f"正在处理文件 {current} / {total}…")
+        self.status_label.setText(f"正在调整图标坐标 {current} / {total}…")
 
     def _render_snapshot(self, snapshot: dict[str, Any]) -> None:
-        self._scan = snapshot["scan"]
+        self._state = snapshot["state"]
+        self._scan = self._state
         self._plan = snapshot["plan"]
+        self._plan_error = snapshot.get("plan_error", "")
+        self._saved_layouts = snapshot["layouts"]
         self._history = snapshot["history"]
         self._has_snapshot = True
-        counts = self._scan.category_counts
-        self.stat_values["files"].setText(str(len(self._scan.files)))
-        self.stat_values["shortcuts"].setText(str(self._scan.shortcut_count))
-        self.stat_values["categories"].setText(str(sum(value > 0 for value in counts.values())))
-        self.stat_values["ignored"].setText(str(self._scan.ignored_count))
-        maximum = max(1, max(counts.values(), default=0))
-        for category in CATEGORY_NAMES:
-            count = counts.get(category, 0)
-            self.category_labels[category].setText(str(count))
-            self.category_bars[category].setValue(round(count / maximum * 100))
-        extensions = sorted(self._scan.extension_counts.items(), key=lambda item: (-item[1], item[0]))
-        self.file_type_summary.setText("常见文件类型  " + "  ·  ".join(
-            f"{extension.upper().lstrip('.')} {count}" for extension, count in extensions[:8]
-        ) if extensions else "暂无可统计的文件类型")
+        self._rules_dirty = False
+        self.stat_values["icons"].setText(str(len(self._state.icons)))
+        for category in CATEGORY_LABELS:
+            self.stat_values[category].setText(str(sum(icon.category == category for icon in self._state.icons)))
+        self.monitor_summary.setText(f"{len(self._state.monitors)} 个显示器 · 图标间距 {self._state.spacing.x}×{self._state.spacing.y}")
+        self.current_canvas.set_layout(self._state)
         self._render_preview()
         self._render_history()
-        self.status_chip.setText("●  扫描已完成")
-        self.status_label.setText(f"扫描完成 · {len(self._plan)} 个文件可整理 · {self._scan.ignored_count} 个对象已忽略")
+        auto = self._state.auto_arrange
+        self.auto_arrange_warning.setVisible(auto)
+        self.auto_arrange_warning.setText("Windows 已开启自动排列，应用排列与恢复暂不可用。请右键桌面 → 查看 → 关闭“自动排列图标”，然后重新扫描。仍可扫描及保存当前布局。")
+        self.status_chip.setText("●  请关闭自动排列" if auto else ("●  需要调整布局规则" if self._plan_error else "●  桌面视图已连接"))
+        self.status_label.setText(self._plan_error or f"已读取 {len(self._state.icons)} 个图标 · 仅调整图标坐标 · 排列前自动保存布局")
         self._update_action_states()
 
     def _render_preview(self) -> None:
+        plan = self._plan
+        items = plan.items if plan is not None else tuple(
+            LayoutItem(icon.identity, icon.name, icon.category, icon.position, icon.position, icon.identity in self.engine.settings.pinned_ids)
+            for icon in self._state.icons
+        ) if self._state is not None else ()
         self.preview_table.blockSignals(True)
-        self.preview_table.setRowCount(len(self._plan))
-        for row, item in enumerate(self._plan):
-            check = QTableWidgetItem()
-            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
-            check.setCheckState(Qt.CheckState.Checked if item.selected else Qt.CheckState.Unchecked)
-            check.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.preview_table.setItem(row, 0, check)
-            for column, text in enumerate([
-                item.source.name, item.category, str(item.source), str(item.destination),
-            ], start=1):
-                cell = QTableWidgetItem(text)
-                cell.setToolTip(text)
-                self.preview_table.setItem(row, column, cell)
+        self.preview_table.setRowCount(len(items))
+        for row, item in enumerate(items):
+            pin = QTableWidgetItem()
+            pin.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
+            pin.setCheckState(Qt.CheckState.Checked if item.pinned else Qt.CheckState.Unchecked)
+            pin.setData(Qt.ItemDataRole.UserRole, item.identity)
+            self.preview_table.setItem(row, 0, pin)
+            name = QTableWidgetItem(item.name)
+            name.setToolTip(item.name)
+            self.preview_table.setItem(row, 1, name)
+            combo = QComboBox()
+            combo.setStyleSheet("QComboBox { padding: 3px 6px; min-height: 20px; }")
+            combo.addItem(f"自动识别（{CATEGORY_LABELS.get(item.category, item.category)}）", "")
+            for category, label in CATEGORY_LABELS.items():
+                combo.addItem(label, category)
+            combo.setCurrentIndex(max(0, combo.findData(self.engine.settings.category_overrides.get(item.identity, ""))))
+            combo.currentIndexChanged.connect(self._icon_rules_edited)
+            self.preview_table.setCellWidget(row, 2, combo)
+            for column, position in [(3, item.source), (4, item.destination)]:
+                self.preview_table.setItem(row, column, QTableWidgetItem(f"({position.x}, {position.y})"))
         self.preview_table.blockSignals(False)
-        self.preview_empty.setVisible(not self._plan)
-        self._selection_changed()
+        self._rules_dirty = False
+        self.preview_canvas.set_layout(self._state, plan)
+        changed = sum(item.source != item.destination for item in items)
+        kind = "恢复布局" if plan is not None and plan.kind == "restore" else "智能排列"
+        self.preview_summary.setText(f"{kind}预览 · {len(items)} 个图标 · {changed} 个位置将调整")
+        warnings = list(plan.warnings) if plan is not None else [self._plan_error] if self._plan_error else []
+        if self._state is not None:
+            warnings.extend(warning for warning in getattr(self._state, "warnings", []) if warning not in warnings)
+        self.plan_warnings.setText("\n".join(warnings))
+        self.plan_warnings.setVisible(bool(warnings))
+        self.confirm_button.setText("确认并恢复布局" if kind == "恢复布局" else "确认并应用排列")
 
     @Slot()
-    def _selection_changed(self, *args: Any) -> None:
-        for row, item in enumerate(self._plan):
-            cell = self.preview_table.item(row, 0)
-            if cell is not None:
-                item.selected = cell.checkState() == Qt.CheckState.Checked
-        selected = sum(bool(item.selected) for item in self._plan)
-        self.preview_summary.setText(f"待整理 {len(self._plan)} 个文件 · 已选择 {selected} 个")
+    def _icon_rules_edited(self, *args: Any) -> None:
+        self._rules_dirty = True
+        self.status_label.setText("固定或分类规则已修改。请先保存规则并重新预览，再应用排列。")
         self._update_action_states()
 
-    def _select_all(self, selected: bool) -> None:
-        self.preview_table.blockSignals(True)
-        for row in range(self.preview_table.rowCount()):
-            self.preview_table.item(row, 0).setCheckState(Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
-        self.preview_table.blockSignals(False)
-        self._selection_changed()
-
     def _render_history(self) -> None:
-        rows = [(record, entry) for record in self._history for entry in record.get("entries", [])]
-        self.history_table.setRowCount(len(rows))
-        statuses = {
-            "moved": "已整理", "undone": "已恢复", "restored": "已恢复", "failed": "失败",
-            "error": "需要关注", "pending": "待处理", "skipped": "已跳过", "conflict": "存在冲突",
-            "completed": "已完成", "partial": "部分完成", "undo_failed": "恢复失败",
-            "moving": "移动待核验", "undoing": "恢复待核验", "running": "进行中",
-            "partially_undone": "部分已恢复",
-        }
-        for row, (record, entry) in enumerate(rows):
-            source = str(entry.get("source", ""))
-            destination = str(entry.get("destination", ""))
-            raw_timestamp = str(record.get("created_at", ""))
+        previous = self.saved_layouts_combo.currentData()
+        self.saved_layouts_combo.blockSignals(True)
+        self.saved_layouts_combo.clear()
+        for layout in self._saved_layouts:
+            name = str(layout.get("name", "未命名布局"))
+            self.saved_layouts_combo.addItem(f"{name} · {len(layout.get('icons', []))} 个图标", layout["id"])
+        index = self.saved_layouts_combo.findData(previous)
+        if index >= 0:
+            self.saved_layouts_combo.setCurrentIndex(index)
+        self.saved_layouts_combo.blockSignals(False)
+        self.history_table.blockSignals(True)
+        self.history_table.setRowCount(len(self._history))
+        kinds = {"saved": "手动保存", "manual": "手动保存", "before_arrange": "排列前备份", "before_restore": "恢复前备份", "before_undo": "撤销前备份"}
+        statuses = {"saved": "已保存", "completed": "已完成", "applied": "已应用", "pending": "待核验", "partial": "部分完成", "undone": "已撤销", "undo_failed": "撤销需重试", "failed": "未完成", "running": "进行中"}
+        for row, record in enumerate(self._history):
+            raw_time = str(record.get("created_at", ""))
             try:
-                timestamp = datetime.fromisoformat(raw_timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
+                timestamp = datetime.fromisoformat(raw_time).astimezone().strftime("%Y-%m-%d %H:%M")
             except ValueError:
-                timestamp = raw_timestamp.replace("T", " ")[:19]
-            status = str(entry.get("status", record.get("status", "")))
-            filename = source.replace("\\", "/").rsplit("/", 1)[-1]
-            values = [timestamp, statuses.get(status, status), filename, source, destination]
+                timestamp = raw_time
+            kind = str(record.get("kind", "saved"))
+            status = str(record.get("status", "saved"))
+            values = [str(record.get("name", "自动保存布局")), timestamp, kinds.get(kind, kind), str(len(record.get("icons", []))), statuses.get(status, status)]
             for column, text in enumerate(values):
                 cell = QTableWidgetItem(text)
-                cell.setToolTip(str(entry.get("error", "")) or text)
+                cell.setToolTip(text)
+                cell.setData(Qt.ItemDataRole.UserRole, record["id"])
                 self.history_table.setItem(row, column, cell)
-        self.history_empty.setVisible(not rows)
+        self.history_table.blockSignals(False)
+        self.history_empty.setVisible(not self._history)
 
-    def _update_action_states(self) -> None:
+    @Slot()
+    def _select_history_layout(self) -> None:
+        selected = self.history_table.selectedItems()
+        if selected:
+            index = self.saved_layouts_combo.findData(selected[0].data(Qt.ItemDataRole.UserRole))
+            if index >= 0:
+                self.saved_layouts_combo.setCurrentIndex(index)
+
+    @Slot()
+    def _update_action_states(self, *args: Any) -> None:
         available = not self.busy
-        self.organize_button.setEnabled(available and self._has_snapshot and bool(self._plan))
-        self.confirm_button.setEnabled(available and any(item.selected for item in self._plan))
-        recoverable = {"moved", "moving", "undo_failed", "undoing"}
-        can_undo = any(entry.get("status") in recoverable for record in self._history for entry in record.get("entries", []))
-        self.undo_button.setEnabled(available and can_undo)
-        self.history_undo_button.setEnabled(available and can_undo)
+        state_ready = self._has_snapshot and self._state is not None
+        arrange_ready = available and state_ready and not self._state.auto_arrange
+        self.organize_button.setEnabled(arrange_ready)
+        self.save_layout_button.setEnabled(available and state_ready)
+        self.history_save_button.setEnabled(available and state_ready)
+        self.restore_layout_button.setEnabled(arrange_ready and self.saved_layouts_combo.currentData() is not None)
+        self.confirm_button.setEnabled(arrange_ready and self._plan is not None and not getattr(self, "_rules_dirty", False) and any(item.source != item.destination for item in self._plan.items))
+        can_undo = any(record.get("can_undo") and record.get("status") != "undone" for record in self._history)
+        self.undo_button.setEnabled(arrange_ready and can_undo)
+        self.history_undo_button.setEnabled(arrange_ready and can_undo)
+        self.save_icon_rules_button.setEnabled(available and state_ready and getattr(self, "_rules_dirty", False))
+
+    @Slot()
+    def show_arrange_preview(self) -> None:
+        if self._state is None:
+            return
+        def completed(snapshot: dict[str, Any]) -> None:
+            self._render_snapshot(snapshot)
+            self._show_page(1)
+        self._start_job(lambda progress: self._snapshot(), completed, "正在计算分类网格与固定图标…")
+
+    def _show_plan(self, plan: Any) -> None:
+        self._render_snapshot({"state": plan.state, "plan": plan, "layouts": self._saved_layouts, "history": self._history})
+        self._show_page(1)
+        self.status_label.setText("预览已生成。请核对图标坐标，确认后应用。")
+
+    def _result_with_snapshot(self, result: Any) -> dict[str, Any]:
+        try:
+            return {"result": result, "snapshot": self._snapshot(), "refresh_error": ""}
+        except Exception as exc:
+            return {"result": result, "snapshot": None, "refresh_error": str(exc)}
 
     @Slot()
     def request_organize(self) -> None:
-        selected = sum(bool(item.selected) for item in self._plan)
-        if self.busy or not selected:
+        plan = self._plan
+        if self.busy or plan is None or getattr(self, "_rules_dirty", False):
             return
-        answer = QMessageBox.question(
-            self, "确认整理桌面", f"将移动已勾选的 {selected} 个文件。\n\n"
-            f"目标文件夹：\n{self.engine.desktop / 'DesktopPilot整理'}\n\n"
-            "请确认预览中的原位置与目标位置。不会覆盖已有文件，完成后可撤销。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
+        if self._state.auto_arrange:
+            QMessageBox.warning(self, "请先关闭自动排列", self.auto_arrange_warning.text())
+            return
+        count = sum(item.source != item.destination for item in plan.items)
+        if not count:
+            return
+        action = "恢复布局" if plan.kind == "restore" else "排列图标"
+        answer = QMessageBox.question(self, f"确认{action}", f"将调整 {count} 个桌面图标的位置。\n\n请核对预览中的当前坐标与目标坐标。操作前会自动保存当前布局，文件名称、内容与所在目录保持不变。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        plan = list(self._plan)
-
-        def operation(progress: Callable[[int, int], None]) -> dict[str, Any]:
-            result = self.engine.organize(plan, progress=progress)
-            return {"result": result, "snapshot": self._snapshot()}
-
-        self._start_job(operation, lambda value: self._operation_result(value, "整理"), "正在整理文件，请勿关闭窗口…")
+        self._start_job(lambda progress: self._result_with_snapshot(self.engine.organize(plan, progress=progress)), lambda value: self._operation_result(value, action), "正在调整桌面图标坐标，请勿关闭窗口…")
 
     @Slot()
     def request_undo(self) -> None:
-        if self.busy:
+        if self.busy or self._state is None:
             return
-        answer = QMessageBox.question(
-            self, "确认撤销上次整理", "将恢复上一次尚未撤销的整理记录中的文件。\n\n"
-            "若原位置已存在同名文件，或整理后的文件已被修改，将跳过并提示。现有文件不会被覆盖。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        if self._state.auto_arrange:
+            QMessageBox.warning(self, "请先关闭自动排列", self.auto_arrange_warning.text())
             return
-
-        def operation(progress: Callable[[int, int], None]) -> dict[str, Any]:
-            result = self.engine.undo(progress=progress)
-            return {"result": result, "snapshot": self._snapshot()}
-
-        self._start_job(operation, lambda value: self._operation_result(value, "撤销"), "正在恢复文件，请勿关闭窗口…")
+        answer = QMessageBox.question(self, "确认撤销图标排列", "将尝试恢复上一次坐标调整前的桌面布局。\n\n已消失的图标会跳过；新出现的图标保留。请确认当前显示器布局正确。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
+        if answer == QMessageBox.StandardButton.Yes:
+            self._start_job(lambda progress: self._result_with_snapshot(self.engine.undo(progress=progress)), lambda value: self._operation_result(value, "撤销"), "正在恢复上次图标坐标…")
 
     def _operation_result(self, value: dict[str, Any], action: str) -> None:
-        self._render_snapshot(value["snapshot"])
-        result = value["result"]
-        self.status_label.setText(f"{action}完成 · 成功移动 {result.moved_count} 个文件 · {len(result.errors)} 个问题")
-        self.status_chip.setText("●  需要关注" if result.errors else "●  已安全完成")
-        if result.errors:
-            detail = "\n".join(result.errors[:15])
-            if len(result.errors) > 15:
-                detail += f"\n…另有 {len(result.errors) - 15} 个问题，请查看历史记录。"
-            QMessageBox.warning(self, f"{action}部分完成", f"成功移动 {result.moved_count} 个文件。\n\n以下文件未完成：\n{detail}")
+        if value["snapshot"] is not None:
+            self._render_snapshot(value["snapshot"])
         else:
-            QMessageBox.information(self, f"{action}完成", f"已安全移动 {result.moved_count} 个文件。\n可在“整理历史”查看文件位置。")
+            self._plan = None
+        result = value["result"]
+        errors = list(result.errors)
+        warnings = list(getattr(result, "warnings", []))
+        if value["refresh_error"]:
+            warnings.append("坐标操作后重新扫描失败，请手动重新扫描：" + value["refresh_error"])
+        self.status_label.setText(f"{action}完成 · 已调整 {result.changed_count} 个图标 · {len(errors)} 个错误")
+        self.status_chip.setText("●  需要关注" if errors or warnings else "●  布局已更新")
+        details = "\n".join((errors + warnings)[:20])
+        if errors or warnings:
+            QMessageBox.warning(self, f"{action}结果", f"已调整 {result.changed_count} 个图标的位置。\n\n{details}")
+        else:
+            QMessageBox.information(self, f"{action}完成", f"已调整 {result.changed_count} 个图标的位置。\n操作前布局已保存在“布局与历史”。")
+
+    @Slot()
+    def save_current_layout(self) -> None:
+        if self.busy:
+            return
+        name = "手动布局 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def operation(progress: Callable[[int, int], None]) -> dict[str, Any]:
+            self.engine.save_layout(name)
+            return self._snapshot()
+
+        def completed(snapshot: dict[str, Any]) -> None:
+            self._render_snapshot(snapshot)
+            self.status_label.setText("当前图标坐标已保存，可在“布局与历史”选择恢复。")
+
+        self._start_job(operation, completed, "正在保存当前图标布局…")
+
+    @Slot()
+    def restore_layout_preview(self) -> None:
+        identity = self.saved_layouts_combo.currentData()
+        if identity is None or self.busy:
+            return
+        self._start_job(lambda progress: self.engine.restore_preview(str(identity)), self._show_plan, "正在读取布局并生成恢复预览…")
 
     def _load_settings_fields(self) -> None:
         settings = self.engine.settings
         self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(settings.theme)))
-        self.ignore_edit.setPlainText("\n".join(settings.ignored_patterns))
-        self.keep_edit.setPlainText("\n".join(settings.keep_shortcuts))
+        self.category_order_edit.setPlainText("\n".join(CATEGORY_LABELS[category] for category in settings.category_order))
+        self.direction_combo.setCurrentIndex(max(0, self.direction_combo.findData(settings.direction)))
+        self.gap_spin.setValue(settings.category_gap)
+        self.game_rules_edit.setPlainText("\n".join(settings.game_rules))
 
-    @Slot()
-    def save_settings(self) -> None:
-        if self.busy:
-            return
-        theme = str(self.theme_combo.currentData())
-        settings = Settings(
-            theme=theme,
-            ignored_patterns=[line.strip() for line in self.ignore_edit.toPlainText().splitlines() if line.strip()],
-            keep_shortcuts=[line.strip() for line in self.keep_edit.toPlainText().splitlines() if line.strip()],
-        )
-
+    def _save_settings_job(self, settings: Settings) -> None:
         def operation(progress: Callable[[int, int], None]) -> dict[str, Any]:
             self.engine.save_settings(settings)
             return self._snapshot()
 
         def completed(snapshot: dict[str, Any]) -> None:
-            self._apply_theme(theme)
+            self._apply_theme(settings.theme)
             self._render_snapshot(snapshot)
-            self.status_label.setText("设置已保存，已按新规则重新扫描桌面。")
+            self.status_label.setText("设置已保存，已重新计算图标排列预览。")
 
-        self._start_job(operation, completed, "正在保存设置并更新预览…")
+        self._start_job(operation, completed, "正在保存设置并重新计算布局…")
+
+    @Slot()
+    def save_settings(self) -> None:
+        if self.busy:
+            return
+        inverse = {label: category for category, label in CATEGORY_LABELS.items()}
+        order = [inverse.get(line.strip(), line.strip()) for line in self.category_order_edit.toPlainText().splitlines() if line.strip()]
+        settings = replace(self.engine.settings, theme=str(self.theme_combo.currentData()), category_order=order, direction=str(self.direction_combo.currentData()), category_gap=self.gap_spin.value(), game_rules=[line.strip() for line in self.game_rules_edit.toPlainText().splitlines() if line.strip()])
+        try:
+            settings.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "请检查排列设置", str(exc))
+            return
+        self._save_settings_job(settings)
+
+    @Slot()
+    def save_icon_rules(self) -> None:
+        if self.busy or self._state is None:
+            return
+        visible = {icon.identity for icon in self._state.icons}
+        pinned = [identity for identity in self.engine.settings.pinned_ids if identity not in visible]
+        overrides = dict(self.engine.settings.category_overrides)
+        for row in range(self.preview_table.rowCount()):
+            cell = self.preview_table.item(row, 0)
+            identity = str(cell.data(Qt.ItemDataRole.UserRole))
+            if cell.checkState() == Qt.CheckState.Checked:
+                pinned.append(identity)
+            combo = self.preview_table.cellWidget(row, 2)
+            category = str(combo.currentData())
+            if category:
+                overrides[identity] = category
+            else:
+                overrides.pop(identity, None)
+        settings = replace(self.engine.settings, pinned_ids=pinned, category_overrides=overrides)
+        self._save_settings_job(settings)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.busy:
             event.ignore()
-            QMessageBox.information(self, "正在安全处理文件", "请等待当前操作完成后再关闭 DesktopPilot，以便完整保存整理记录。")
+            QMessageBox.information(self, "正在处理桌面布局", "请等待当前操作完成后再关闭 DesktopPilot，以便完整保存图标布局记录。")
         else:
             event.accept()
 
     def _apply_theme(self, theme: str) -> None:
         dark = theme != "light"
+        self.current_canvas.dark = dark
+        self.preview_canvas.dark = dark
+        self.current_canvas.update()
+        self.preview_canvas.update()
         colors = {
             "bg": "#10141d" if dark else "#f3f6fb",
             "side": "#151b27" if dark else "#ffffff",
@@ -791,7 +938,7 @@ class MainWindow(QMainWindow):
             QTableWidget::item {{ padding: 7px; border-bottom: 1px solid {c['line']}; }}
             QHeaderView {{ background: {c['card']}; }}
             QHeaderView::section {{ color: {c['muted']}; background: {c['cardAlt']}; padding: 12px 8px; border: none; border-bottom: 1px solid {c['line']}; font-size: 11px; font-weight: 600; }}
-            QPlainTextEdit, QComboBox {{ background: {c['field']}; border: 1px solid {c['line']}; border-radius: 7px; padding: 9px; selection-background-color: #3b72be; }}
+            QPlainTextEdit, QComboBox, QSpinBox {{ background: {c['field']}; border: 1px solid {c['line']}; border-radius: 7px; padding: 9px; selection-background-color: #3b72be; }}
             QPlainTextEdit:focus, QComboBox:focus {{ border-color: #639af2; }}
             QComboBox::drop-down {{ border: none; width: 23px; }}
             QComboBox QAbstractItemView {{ background: {c['card']}; color: {c['text']}; selection-background-color: {c['selected']}; }}

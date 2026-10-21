@@ -33,6 +33,9 @@ MANIFEST
 *.spec
 !DesktopPilot.spec
 
+# Generated Windows Shell bridge (source is native/desktop_shell.cpp)
+/desktop_pilot/native/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

@@ -1,65 +1,66 @@
-"""An executable diagnostic that operates exclusively on a temporary desktop."""
+"""Packaged diagnostics using simulated icon data, never a real desktop."""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import traceback
 
 
 def run_smoke_test(report_path: str) -> int:
-    """Exercise bundled Qt, the core workflow and a real Qt event loop.
-
-    The report is required because the windowed Windows executable has no stdout.
-    All application data and files used here belong to TemporaryDirectory.
-    """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    report: dict = {"status": "failed"}
-    window = None
+    report: dict = {"status": "failed", "real_desktop_tested": False}
     try:
-        from PySide6.QtCore import QEventLoop, QThread, QTimer
+        from PySide6.QtCore import QEventLoop, QTimer
         from PySide6.QtWidgets import QApplication
         from desktop_pilot.core import Engine
         from desktop_pilot.gui import MainWindow
+        from desktop_pilot.simulation import SimulatedBackend
 
+        native_loaded = False
+        if sys.platform == "win32":
+            from desktop_pilot.windows import WindowsShellBackend
+            # Only inspect DLL exports. Do NOT invoke any Shell entry point.
+            WindowsShellBackend().validate_library()
+            native_loaded = True
         app = QApplication.instance() or QApplication([])
         app.setQuitOnLastWindowClosed(False)
-        with tempfile.TemporaryDirectory(prefix="DesktopPilot-smoke-") as directory:
-            base = Path(directory)
-            desktop = base / "desktop"
-            desktop.mkdir()
-            original = {"课件.pdf": b"diagnostic pdf", "Browser.lnk": b"shortcut fixture"}
-            for name, content in original.items():
-                (desktop / name).write_bytes(content)
-            engine = Engine(desktop=desktop, data_dir=base / "state")
-            scan = engine.scan()
-            if len(scan.files) != 2 or scan.shortcut_count != 1:
-                raise RuntimeError("扫描自检失败")
-            plan = engine.preview(scan)
-            organized = engine.organize(plan)
-            if organized.errors or organized.moved_count != 2:
-                raise RuntimeError(f"整理自检失败：{organized.errors}")
-            undone = engine.undo()
-            if undone.errors or undone.moved_count != 2:
-                raise RuntimeError(f"撤销自检失败：{undone.errors}")
-            if any((desktop / name).read_bytes() != data for name, data in original.items()):
-                raise RuntimeError("撤销后的文件内容不一致")
+        with tempfile.TemporaryDirectory(prefix="DesktopPilot-icon-diagnostic-") as directory:
+            backend = SimulatedBackend()
+            original = backend.read()
+            engine = Engine(backend=backend, data_dir=Path(directory))
+            saved = engine.save_layout("模拟原始布局")
+            state = engine.scan()
+            plan = engine.preview(state)
+            result = engine.organize(plan)
+            if result.errors or result.changed_count <= 0:
+                raise RuntimeError(f"模拟排列失败：{result.errors}")
+            undo = engine.undo()
+            if undo.errors or {i.identity: i.position for i in backend.read().icons} != {i.identity: i.position for i in original.icons}:
+                raise RuntimeError(f"模拟撤销失败：{undo.errors}")
+            restore = engine.restore_preview(saved["id"])
+            result_restore = engine.organize(restore)
+            if result_restore.errors:
+                raise RuntimeError(f"模拟快照恢复失败：{result_restore.errors}")
             window = MainWindow(engine=engine)
             window.show()
             loop = QEventLoop()
-            QTimer.singleShot(1500, loop.quit)
+            QTimer.singleShot(1200, loop.quit)
             loop.exec()
-            # Wait for the initial worker before Qt destroys the window.
-            for thread in window.findChildren(QThread):
-                if thread.isRunning() and not thread.wait(10000):
-                    raise RuntimeError("界面后台扫描超时")
-            app.processEvents()
-            if not window.scan_button.isEnabled():
-                raise RuntimeError("界面初次扫描未完成")
+            if window.busy:
+                raise RuntimeError("模拟界面后台读取未完成")
+            if not window._has_snapshot:
+                raise RuntimeError("模拟界面未显示图标布局")
             window.close()
             app.processEvents()
-            report = {"status": "ok", "scanned": 2, "organized": 2, "restored": 2, "qt_window": True}
+            report = {
+                "status": "ok", "backend": "simulated", "real_desktop_tested": False,
+                "icons": len(state.icons), "arranged": result.changed_count,
+                "restored": undo.changed_count, "qt_window": True,
+                "native_dll_exports_loaded": native_loaded,
+            }
     except Exception:
         report["error"] = traceback.format_exc()
     Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
