@@ -1,3 +1,3 @@
-"""DesktopPilot: a preview-first, reversible desktop organizer."""
+"""DesktopPilot: preview-first, reversible Windows desktop icon arrangement."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

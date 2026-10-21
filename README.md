@@ -1,133 +1,161 @@
 # DesktopPilot
 
-**Windows 智能桌面整理助手** · Python 3.12 / PySide6
+**Windows 桌面图标智能排列助手** · Python 3.12 / PySide6 / Windows Shell COM
 
-扫描桌面，预览分类结果，确认后整理，再按需撤销。DesktopPilot 将桌面上的普通文件和软件快捷方式归入 `DesktopPilot整理`，提供深色 / 浅色界面、统计仪表盘、分类预览、进度反馈、整理历史和本地设置。
+DesktopPilot 读取资源管理器桌面上实际显示的图标，按“文件夹、普通软件、游戏、普通文件、系统图标”规划排列区域，展示前后坐标预览，确认后调整图标位置。支持深色 / 浅色界面、分类顺序、横向 / 纵向排列、分组间隔、固定图标、保存布局与撤销。
 
-> 当前版本为早期开发版本。建议首次使用前备份重要文件，并先在临时桌面目录中体验。程序不需要管理员权限，也不需要 API 密钥或云服务。
+本版本只修改图标坐标。文件与文件夹的磁盘路径、内容、名称均保持不变；不创建分类文件夹，不搬移文件，不删除文件，也不启动快捷方式目标。旧版本的文件归档行为已移除。
 
 ## 界面预览
 
-以下为 Qt 离屏运行截图，展示临时测试数据。
+以下截图由模拟图标数据生成，展示 Qt 界面，不代表真实 Windows Shell 排列验收。
 
-| 深色主题 | 浅色主题 |
+| 控制中心 | 坐标排列预览 |
 | --- | --- |
-| ![深色桌面概览](docs/images/dashboard-dark.png) | ![浅色桌面概览](docs/images/dashboard-light.png) |
+| ![深色控制中心](docs/images/dashboard-dark.png) | ![布局预览](docs/images/layout-preview.png) |
 
-## 下载并运行 Windows exe
+## 下载 Windows exe
 
-1. 打开本仓库的 **Actions → Build Windows executable**。
-2. 选择一次成功完成的构建。推送到 `main` 会自动构建，也可点击 **Run workflow** 手动触发；Pull Request 也会运行测试和构建。
-3. 在该次运行的 **Artifacts** 中下载 `DesktopPilot-Windows`（下载通常需要登录 GitHub）。
-4. 解压下载的 zip，双击其中的 **DesktopPilot.exe**，无需另行安装 Python。
+1. 打开仓库的 **Actions → Build Windows executable**，选择一次成功完成的构建。
+2. 在该次运行的 **Artifacts** 中下载 `DesktopPilot-Windows`（通常需要登录 GitHub）。
+3. 解压 zip，运行 **DesktopPilot.exe**，无需安装 Python 或 Visual Studio。
 
-构建产物默认保留 30 天。尚未完成的构建不会提供 exe；本地源码和 CI 配置不代表已有发布产物。当前 exe 未做代码签名，Windows 可能显示 SmartScreen 提示；请确认下载来源，遵循所在组织的安全策略。目标系统为 Windows 10/11 64 位。
+推送到 `main`、面向 `main` 的 Pull Request 和手动 **Run workflow** 均可触发构建。产物默认保留 30 天。当前 exe 未做代码签名，Windows 可能显示 SmartScreen 提示；请核对下载来源并遵循所在组织的安全策略。目标系统为 Windows 10/11 x64。
 
 ## 使用流程
 
-1. **扫描桌面**：启动时获取 Windows 当前用户的真实桌面目录，支持 OneDrive 桌面重定向；也可手动重新扫描。仪表盘显示文件、类型和快捷方式统计。
-2. **查看预览**：点击“一键整理”进入预览，逐项查看原位置、目标位置和类别。取消勾选的文件不会移动。
-3. **确认整理**：只有再次确认后才执行移动。进度条展示执行情况，发生错误会显示原因，并保留已完成操作的历史。
-4. **撤销整理**：点击撤销并确认，将上次可恢复的整理结果移回原位置。原位置已被占用或目标文件发生变化时会拒绝恢复，不覆盖已有文件。
-5. **调整设置**：切换主题、自定义忽略规则，以及指定始终留在桌面的快捷方式。
+1. **关闭自动排列**：在 Windows 桌面空白处右键 → **查看**，取消勾选 **自动排列图标**。DesktopPilot 检测到该选项开启时会阻止应用布局，并给出操作提示；不会替用户更改此系统设置。
+2. **扫描实际桌面**：获取 Explorer 当前显示的图标与坐标，包括当前用户桌面、公共桌面，以及回收站等 Shell 虚拟图标。OneDrive 重定向由 Explorer 自身处理。
+3. **设置分类与布局**：调整分类顺序、排列方向和类别间隔，选择固定图标；固定图标保留当前位置。
+4. **检查预览**：查看图标类别、原坐标和目标坐标，确认空间与位置符合预期，再执行排列。扫描和预览不改变图标坐标。
+5. **保存与恢复**：可保存当前布局，之后预览恢复；应用任何布局前都会记录原始坐标。撤销恢复最近一次排列前的位置。
 
-### 分类目录
+图标过多、可用工作区域不足、显示器布局变化或某些图标无法读取时，程序会提示问题；请检查预览与执行摘要。排列按网格规划，不承诺每种桌面缩放、第三方桌面替代程序或远程会话均呈现相同视觉结果。
 
-只处理桌面第一层的普通文件，不递归整理目录。文件按扩展名分类：
+### 分类规则
 
-| 分类 | 常见内容 |
+| 分类 | 判定依据 |
 | --- | --- |
-| 文档与课件 | Word、PDF、Excel、PowerPoint、文本等 |
-| 图片与截图 | PNG、JPEG、GIF、WebP 等 |
-| 视频与音频 | MP4、MKV、MP3、WAV 等 |
-| 代码与开发 | Python、JavaScript、HTML、JSON 等 |
-| 压缩文件 | ZIP、RAR、7z、TAR 等 |
-| 软件快捷方式 | `.lnk`、`.url` |
-| 其他文件 | 未匹配以上规则的普通文件 |
+| 文件夹 | Shell 提供的文件夹属性 |
+| 普通软件 | 应用快捷方式或程序图标；不确定的快捷方式保守归入普通软件 |
+| 游戏 | 快捷方式目标 / 参数命中可配置游戏规则，如 Steam、Epic Games |
+| 普通文件 | 其余文件系统项目 |
+| 系统图标 | 回收站等非文件系统 Shell 项目 |
 
-例如：`桌面/报告.pdf` → `桌面/DesktopPilot整理/文档与课件/报告.pdf`。扩展名匹配不区分大小写；只移动快捷方式文件，不解析或移动它指向的程序。
+游戏识别不依赖联网或 AI；无法仅凭快捷方式准确识别所有游戏，用户可添加规则或覆盖单个图标类别。规则与忽略列表支持通配符。读取 `.lnk` 元数据时不调用 `IShellLink::Resolve`，也不会打开、启动或访问目标程序；`.url` 只读取其已存储的目标信息。
 
-### 忽略与保留
+### 稳定标识与恢复
 
-- 默认跳过目录、隐藏 / 系统文件、`desktop.ini`、符号链接、Windows 重解析点（包括 junction）以及特殊文件对象。
-- OneDrive 重定向的桌面路径由 Windows API 获取；带重解析属性的云占位文件会保守跳过，不会自动下载或强制移动。
-- 跳过应用程序本体和安装程序（`.exe`、`.com`、`.msi`、`.msix`、`.msixbundle`、`.appx`、`.appxbundle`、`.dll`、`.sys`、`.scr`）；不递归进入 `DesktopPilot整理`。
-- 自定义忽略列表支持通配符，例如 `重要*`、`*.tmp`；每行填写一条规则。
-- 保留快捷方式列表填写快捷方式完整文件名，例如 `微信.lnk`、`工作门户.url`；每行一个。
-- 重名时预览会给出带编号的可用目标名；执行时若该位置已被占用，会报告冲突，不覆盖文件。
+恢复依据图标稳定标识，而非列表行号或显示名称：文件系统项目使用卷、文件 ID 与创建时间，降低删除后文件 ID 被重用导致误匹配的风险；虚拟项目使用规范 Shell 解析标识。文件重命名后通常仍可对应原图标；删除后以同名新建的项目不会仅凭名称恢复。
+
+布局还记录显示器工作区域、图标间距等环境信息。显示器移除、分辨率 / DPI 改变或图标已不存在时，应先查看恢复预览和提示，避免将图标放到不可见区域。Explorer 重启、第三方程序或用户同时拖动图标也可能使旧预览失效，请重新扫描。
 
 ## 从源码运行
 
-安装 **Python 3.12** 后，在 PowerShell 中执行：
+需要 **Windows 10/11 x64、Python 3.12 x64、Visual Studio 2022 Build Tools**。安装 Build Tools 时勾选 **使用 C++ 的桌面开发**，包含 MSVC x64 工具链和 Windows 10/11 SDK。
 
-```powershell
+在 **x64 Native Tools Command Prompt for VS 2022** 中执行：
+
+```bat
 git clone https://github.com/ViIiOleTe/DesktopPilot-Windows-desktop-smart-organizer.git
 cd DesktopPilot-Windows-desktop-smart-organizer
 py -3.12 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python -m desktop_pilot
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+tools\build_native.cmd
+.venv\Scripts\python -m desktop_pilot
 ```
 
-仅运行应用也可安装 `requirements.txt`；在仓库根目录执行 `python -m desktop_pilot`。开发安装还会注册 `desktop-pilot` 命令。
+`tools\build_native.cmd` 使用 Windows SDK 编译 `native/desktop_shell.cpp`，输出 `desktop_pilot/native/desktop_shell.dll`；中间文件位于 `build/native`。仅运行已有源码时可安装 `requirements.txt`，但仍需先构建 DLL。应用无需管理员权限、API 密钥或第三方 Python COM 包。
 
-运行测试：
+### Windows 原生桥接
 
-```powershell
-$env:QT_QPA_PLATFORM = "offscreen"
-.\.venv\Scripts\python -m pytest -q
+Python 通过 `ctypes` 调用项目自带的 C++ DLL。DLL 使用 Windows SDK 定义的 COM 接口连接 Explorer 桌面视图，并通过以下受支持接口操作：
+
+- `IFolderView::Items`：枚举当前桌面视图中的项目。
+- `IFolderView::GetItemPosition`、`GetSpacing`：读取图标位置与网格间距。
+- `IFolderView::SelectAndPositionItems`：设置选定图标的坐标。
+
+桥接层只读取项目元数据和调整桌面坐标，不调用文件移动、重命名、删除或启动 API。桌面视图暂不可用时会报错，不能用磁盘目录枚举冒充实际桌面视图。该机制依赖正在运行的 Windows Explorer 与交互式桌面会话。
+
+坐标使用 Explorer 桌面视图的客户端坐标系。显示器工作区通过 `MapWindowPoints` 映射到同一空间，桥接线程匹配 Explorer 的 DPI 上下文；Qt 只缩放预览画布，不对实际坐标再次乘以 DPI 比例。
+
+微软接口参考：[IFolderView](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifolderview)、[SelectAndPositionItems](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifolderview-selectandpositionitems)、[GetAutoArrange](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifolderview-getautoarrange)。
+
+## 测试与 CI
+
+Windows 本地自动化检查：
+
+```bat
+tools\build_native.cmd
+set QT_QPA_PLATFORM=offscreen
+.venv\Scripts\python -m pytest -q
+.venv\Scripts\python -m desktop_pilot --smoke-test "%TEMP%\desktoppilot-smoke.json"
 ```
 
-所有自动化文件操作测试均使用临时目录，不读写真实桌面。CI 在运行 pytest 后生成 exe，再离屏启动打包后的 exe：使用临时目录验证整理与撤销、校验文件内容并创建窗口，确认成功后才上传产物。Windows Runner 运行原生文件移动、隐藏 / 系统属性和 junction 测试；桌面路径 API 的成功、失败及内存释放采用模拟测试。Linux 可验证跨平台核心与 Qt 离屏界面，无法据此确认真实 Windows / OneDrive 桌面集成和 exe 运行正常。
+所有自动化测试使用模拟桌面后端和临时 JSON 数据目录，不读取真实桌面，也不移动真实图标。Windows 检查可验证 DLL 被加载、导出函数存在；不会调用真实 Explorer 枚举或定位接口。退出码为 0 且诊断 JSON 的 `status` 为 `ok` 表示模拟自检通过。
 
-Linux 开发检查：
+CI 使用 `windows-latest` 与 Python 3.12：安装依赖 → 初始化 MSVC x64 → 构建原生 DLL → pytest → PyInstaller → 启动 exe 的模拟后端自检 → 上传产物。打包自检验证 Qt、模拟布局与持久化，以及 Windows DLL 加载和导出，不代表真实 Explorer COM 行为或可见图标坐标已获验证。
+
+Linux 云环境可以检查布局、分类、存储和 Qt 离屏界面：
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
-```
-
-Qt 离屏模式是测试用途；实际桌面界面需要图形会话。Linux 的 `~/Desktop` 仅作为开发环境回退路径，不提供 Windows 桌面整理体验。
-
-不接触真实桌面的完整诊断（Qt 窗口、临时文件扫描、整理和撤销）：
-
-```bash
 .venv/bin/python -m desktop_pilot --smoke-test /tmp/desktoppilot-smoke.json
 ```
 
-退出码为 0 且报告的 `status` 为 `ok` 表示诊断通过；Windows exe 同样支持 `DesktopPilot.exe --smoke-test <报告路径>`。
+Linux 没有 Explorer 桌面视图，也不能交叉生成 Windows DLL / exe。Linux 构建只能用于模拟后端诊断，不能整理 Windows 图标。
 
-## Windows 打包
+## Windows exe 打包
 
-在 Windows 上运行以下命令，输出为 `dist/DesktopPilot.exe`：
+在 x64 VS 2022 开发者命令行中运行：
 
-```powershell
-.\.venv\Scripts\python -m PyInstaller --noconfirm --clean DesktopPilot.spec
+```bat
+tools\build_native.cmd
+.venv\Scripts\python -m PyInstaller --noconfirm --clean DesktopPilot.spec
 ```
 
-PyInstaller 不能从 Linux 交叉生成 Windows exe，请使用 Windows 本机或仓库提供的 GitHub Actions。单文件 exe 首次启动会将 Qt 运行库解压到临时目录，启动速度可能稍慢。
+输出为 `dist/DesktopPilot.exe`。Windows 构建缺少 `desktop_shell.dll` 时会立即失败；spec 将 DLL、Qt 依赖和图标资源一起打包。单文件程序首次启动需要解压运行库，启动可能稍慢。
 
-## 数据与安全边界
+## 本地数据
 
-设置与整理历史分别以 `settings.json` 和 `history.json` 保存在用户本地应用数据目录（Windows 为 `%LOCALAPPDATA%\DesktopPilot`）；Linux 为 `$XDG_CONFIG_HOME/DesktopPilot`，未设置时使用 `~/.config/DesktopPilot`。移动记录包含完整文件路径，请妥善保管本地历史。删除历史会失去对应的撤销依据。
+Windows 数据目录为 `%LOCALAPPDATA%\DesktopPilot`；Linux 模拟开发使用 `$XDG_CONFIG_HOME/DesktopPilot`，未设置时为 `~/.config/DesktopPilot`。
 
-- 默认不删除用户文件，也不清空分类文件夹；撤销只移动文件，不替用户清理目录。
-- 文件移动前再次校验预览来源和目标，拒绝越出桌面 / 分类目录的请求，避免旧预览误操作。
-- 历史记录用于恢复已记录的移动；备份、杀毒软件、同步客户端和第三方程序同时改动文件，仍可能使某些项目无法撤销。请先停止这些冲突操作，再查看错误并重试。
-- 整理不是多文件原子事务：某个文件失败时，其他已成功的移动保留并可撤销。请查看完成摘要和历史。
-- 不扫描目录内容，不识别快捷方式目标的应用类型，不内置 AI 模型，不上传文件。
-- 只整理当前用户桌面，不处理公共桌面或回收站等 Windows 虚拟图标。
+- `icon-settings.json`：主题、分类规则、排列选项、固定图标等设置。
+- `icon-layouts.json`：已保存布局和排列前坐标快照，供恢复与撤销。
+
+布局含图标名称、稳定标识和坐标，请按本地隐私数据保管。损坏 JSON 不会被静默覆盖。旧版 `settings.json` / `history.json` 保留原样，本版本不将文件移动历史转换为坐标布局，也不执行旧版文件撤销。
+
+## 手工 Windows 10/11 验收
+
+真实桌面集成需要在交互式 Windows 会话中单独确认。建议先记录当前桌面，再按以下清单验收；CI 不会执行这些操作。
+
+- 自动排列开启时应阻止执行；关闭后可以扫描、预览并排列。
+- 检查当前用户、公共桌面、回收站等实际显示项目都能被正确识别；确认扫描坐标与可见图标相符。
+- 排列前后对比文件路径、名称、内容与目录结构，确认均保持不变。
+- 执行布局后检查可见坐标、类别顺序、类别间隔、横向 / 纵向规则和固定图标。
+- 验证撤销、保存布局再恢复；重命名图标后仍能识别，删除图标后应跳过并提示，同名新图标不能误恢复。
+- 验证双显示器、移除显示器、负坐标、不同缩放比例与 DPI、改变分辨率后的恢复提示和可见范围。
+- 使用足够多的图标验证空间不足提示；检查不会重叠固定位置或悄悄漏排。
+- 单独验证“将图标与网格对齐”开启的情况。微软没有提供受支持的网格原点查询；若 Explorer 将请求坐标吸附为不同位置，程序会提示回读不一致并保留原快照供恢复，不会静默声称成功。
+- 验证 Explorer 重启和手工拖动导致旧预览失效的情况；错误后可重新扫描，不启动任何快捷方式目标。
 
 ## 项目结构
 
 ```text
+native/desktop_shell.cpp       # Windows SDK COM 桌面视图桥接
+工具链 → desktop_pilot/native/desktop_shell.dll
 desktop_pilot/
-  __main__.py       # Qt 入口
-  core.py           # 扫描、分类、预览、整理和撤销
-  storage.py        # 本地设置与历史存储
-  windows.py        # Windows 桌面目录解析
-  gui.py            # 仪表盘、预览、历史与设置界面
-tests/              # 临时目录与离屏界面测试
-DesktopPilot.spec   # PyInstaller 单文件构建
+  __main__.py                 # Qt / 模拟自检入口
+  models.py                   # 图标、坐标、显示器和布局模型
+  core.py                     # 分类、网格规划、恢复与撤销
+  storage.py                  # 原子 JSON 设置与布局存储
+  windows.py                  # ctypes 原生桥接适配器
+  gui.py                      # 仪表盘、布局预览、历史和设置
+  smoke.py                    # 不触碰真实桌面的模拟诊断
+tests/                        # 临时数据与模拟后端测试
+tools/build_native.cmd        # MSVC x64 DLL 构建
+DesktopPilot.spec             # PyInstaller 单文件 exe
 .github/workflows/build-windows.yml
 ```

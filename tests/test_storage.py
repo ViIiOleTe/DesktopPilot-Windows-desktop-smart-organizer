@@ -1,188 +1,145 @@
 from __future__ import annotations
 
-import ctypes
 import json
-from pathlib import Path
-from unittest.mock import Mock
-import uuid
+import os
 
 import pytest
 
-from desktop_pilot.storage import JsonStore, Settings
-from desktop_pilot import windows
+from desktop_pilot.models import Settings
+from desktop_pilot.storage import JsonStore
 
 
-def record():
+def snapshot():
     return {
-        "id": "test-operation",
-        "created_at": "2026-10-21T12:00:00+00:00",
-        "status": "completed",
-        "entries": [{"source": "/Desktop/a.txt", "destination": "/Desktop/organized/a.txt", "status": "moved"}],
+        "id": "snapshot-id", "name": "工作布局", "created_at": "2026-10-21T10:00:00+00:00",
+        "kind": "saved", "status": "saved", "can_undo": False,
+        "icons": [{"identity": "file-id", "name": "讲义", "x": -100, "y": 50}],
+        "monitors": [{"id": "main", "work_area": {"left": -1920, "top": 0, "right": 0, "bottom": 1080}, "dpi": 144}],
+        "spacing": {"x": 100, "y": 100}, "icon_size": 32, "auto_arrange": False,
     }
 
 
-def test_defaults_and_settings_round_trip(tmp_path):
+def test_defaults_and_unicode_roundtrip(tmp_path):
     store = JsonStore(tmp_path / "state")
     assert store.load_settings() == Settings()
-    assert store.load_history() == []
-    settings = Settings(theme="light", ignored_patterns=["*.tmp", "私人*"], keep_shortcuts=["浏览器.lnk"])
+    assert store.load_layouts() == []
+    settings = Settings(theme="light", pinned_ids=["文件-id"], category_overrides={"文件-id": "game"})
     store.save_settings(settings)
-    assert JsonStore(store.data_dir).load_settings() == settings
-    assert "浏览器" in (store.data_dir / "settings.json").read_text(encoding="utf-8")
-    assert list(store.data_dir.glob("*.tmp")) == []
+    store.save_layouts([snapshot()])
+    reopened = JsonStore(store.data_dir)
+    assert reopened.load_settings() == settings
+    assert reopened.load_layouts() == [snapshot()]
+    assert "工作布局" in (store.data_dir / store.LAYOUTS_NAME).read_text(encoding="utf-8")
 
 
-def test_mutable_settings_defaults_are_independent():
-    first, second = Settings(), Settings()
-    first.ignored_patterns.append("private*")
-    assert second.ignored_patterns == []
-
-
-def test_history_round_trip_preserves_extra_metadata(tmp_path):
-    history = [record()]
-    history[0]["entries"][0]["fingerprint"] = {"sha256": "abcdef"}
+def test_legacy_file_move_history_and_settings_are_never_loaded_or_modified(tmp_path):
+    legacy_settings = tmp_path / "settings.json"
+    legacy_history = tmp_path / "history.json"
+    legacy_settings.write_bytes(b'{"keep_shortcuts":["app.lnk"]}')
+    legacy_history.write_bytes(b'[{"source":"user-file","destination":"other"}]')
+    before = {path: path.read_bytes() for path in (legacy_settings, legacy_history)}
     store = JsonStore(tmp_path)
-    store.save_history(history)
-    assert JsonStore(tmp_path).load_history() == history
+    assert store.load_settings() == Settings() and store.load_layouts() == []
+    store.save_settings(Settings())
+    store.save_layouts([snapshot()])
+    assert all(path.read_bytes() == data for path, data in before.items())
 
 
-@pytest.mark.parametrize("contents", ["{invalid", "\ufffd not JSON", "null", "[]", '{"theme":"unknown"}', '{"ignored_patterns":"*.tmp"}', '{"unknown":true}'])
-def test_corrupt_settings_are_preserved(tmp_path, contents):
-    path = tmp_path / "settings.json"
-    path.write_text(contents, encoding="utf-8")
-    with pytest.raises(ValueError):
-        JsonStore(tmp_path).load_settings()
-    assert path.read_text(encoding="utf-8") == contents
-
-
-@pytest.mark.parametrize("history", [None, {}, [{}], [{"id": "x", "created_at": "now", "status": "done", "entries": [None]}]])
-def test_invalid_history_rejected(tmp_path, history):
-    path = tmp_path / "history.json"
-    path.write_text(json.dumps(history), encoding="utf-8")
-    with pytest.raises(ValueError):
-        JsonStore(tmp_path).load_history()
-    assert json.loads(path.read_text(encoding="utf-8")) == history
-
-
-def test_duplicate_operation_ids_rejected(tmp_path):
-    with pytest.raises(ValueError, match="重复"):
-        JsonStore(tmp_path).save_history([record(), record()])
-    assert not (tmp_path / "history.json").exists()
-
-
-def test_failed_replace_preserves_original_and_cleans_temporary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("filename", [JsonStore.SETTINGS_NAME, JsonStore.LAYOUTS_NAME])
+def test_corrupt_json_is_reported_and_preserved(tmp_path, filename):
     store = JsonStore(tmp_path)
-    store.save_settings(Settings(theme="light"))
-    original = (tmp_path / "settings.json").read_bytes()
-    def fail(*_):
-        raise OSError("simulated disk error")
-    monkeypatch.setattr("desktop_pilot.storage.os.replace", fail)
-    with pytest.raises(OSError, match="disk error"):
-        store.save_settings(Settings(theme="dark"))
-    assert (tmp_path / "settings.json").read_bytes() == original
-    assert {path.name for path in tmp_path.iterdir()} == {"settings.json"}
+    path = tmp_path / filename
+    path.write_bytes(b"corrupted json\xff")
+    with pytest.raises(ValueError, match="原文件已保留"):
+        (store.load_settings if filename == store.SETTINGS_NAME else store.load_layouts)()
+    assert path.read_bytes() == b"corrupted json\xff"
 
 
-def test_invalid_settings_never_replace_saved_value(tmp_path):
+def test_atomic_replace_failure_preserves_previous_settings(tmp_path, monkeypatch):
     store = JsonStore(tmp_path)
     store.save_settings(Settings())
+    path = tmp_path / store.SETTINGS_NAME
+    original = path.read_bytes()
+    def fail(*args):
+        raise OSError("replace failed")
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError):
+        store.save_settings(Settings(theme="light"))
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("theme", "other"), ("theme", []), ("direction", "diagonal"), ("direction", {}),
+    ("category_order", ["folder"]), ("category_order", [[], "software", "game", "file", "system"]),
+    ("category_gap", -1), ("category_gap", True), ("category_gap", 11),
+    ("pinned_ids", "all"), ("ignored_patterns", [None]), ("game_rules", [""]),
+    ("category_overrides", {"id": "unknown"}), ("category_overrides", {"id": []}),
+])
+def test_invalid_settings_fail_without_writing(tmp_path, field, value):
+    store = JsonStore(tmp_path)
+    settings = Settings()
+    setattr(settings, field, value)
     with pytest.raises(ValueError):
-        store.save_settings(Settings(ignored_patterns=[""]))
-    assert store.load_settings() == Settings()
+        store.save_settings(settings)
+    assert not (tmp_path / store.SETTINGS_NAME).exists()
 
 
-def make_symlink_or_skip(link: Path, target: Path, *, directory=False):
+def test_unknown_settings_fields_are_not_silently_accepted(tmp_path):
+    store = JsonStore(tmp_path)
+    (tmp_path / store.SETTINGS_NAME).write_text('{"keep_shortcuts":[]}', encoding="utf-8")
+    with pytest.raises(ValueError):
+        store.load_settings()
+
+
+@pytest.mark.parametrize("mutator", [
+    lambda item: item.update(id=""),
+    lambda item: item.update(icons=[{"identity": "a", "x": True, "y": 0}]),
+    lambda item: item.update(icons=[{"identity": "a", "x": 1, "y": 2}] * 2),
+    lambda item: item.update(monitors=[]),
+    lambda item: item.update(spacing={"x": 0, "y": 10}),
+    lambda item: item.update(auto_arrange="false"),
+    lambda item: item.update(can_undo=1),
+])
+def test_invalid_snapshot_schema_is_rejected(tmp_path, mutator):
+    store = JsonStore(tmp_path)
+    item = snapshot()
+    mutator(item)
+    with pytest.raises(ValueError):
+        store.save_layouts([item])
+    assert not (tmp_path / store.LAYOUTS_NAME).exists()
+
+
+def test_duplicate_snapshot_ids_are_rejected(tmp_path):
+    store = JsonStore(tmp_path)
+    with pytest.raises(ValueError, match="重复编号"):
+        store.save_layouts([snapshot(), snapshot()])
+
+
+def test_symlinked_config_directory_is_refused(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "redirected"
     try:
-        link.symlink_to(target, target_is_directory=directory)
+        link.symlink_to(outside, target_is_directory=True)
     except OSError:
-        pytest.skip("This runner cannot create symbolic links.")
-
-
-def test_state_directory_symlink_rejected(tmp_path):
-    target = tmp_path / "target"
-    target.mkdir()
-    link = tmp_path / "link"
-    make_symlink_or_skip(link, target, directory=True)
+        pytest.skip("symbolic-link privilege unavailable")
     with pytest.raises(ValueError, match="符号链接"):
         JsonStore(link)
-    assert list(target.iterdir()) == []
+    assert not list(outside.iterdir())
 
 
-def test_state_file_symlink_rejected_without_changing_target(tmp_path):
-    target = tmp_path / "target.json"
-    target.write_text("{}", encoding="utf-8")
-    state = tmp_path / "state"
-    state.mkdir()
-    make_symlink_or_skip(state / "settings.json", target)
-    store = JsonStore(state)
+def test_symlinked_snapshot_file_is_never_followed(tmp_path):
+    store = JsonStore(tmp_path / "state")
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"user data")
+    try:
+        (store.data_dir / store.LAYOUTS_NAME).symlink_to(outside)
+    except OSError:
+        pytest.skip("symbolic-link privilege unavailable")
     with pytest.raises(ValueError, match="符号链接"):
-        store.load_settings()
+        store.load_layouts()
     with pytest.raises(ValueError, match="符号链接"):
-        store.save_settings(Settings())
-    assert target.read_text(encoding="utf-8") == "{}"
-
-
-def test_state_parent_symlink_rejected(tmp_path):
-    target = tmp_path / "target"
-    target.mkdir()
-    link = tmp_path / "link"
-    make_symlink_or_skip(link, target, directory=True)
-    with pytest.raises(ValueError):
-        JsonStore(link / "nested")
-    assert list(target.iterdir()) == []
-
-
-def test_non_windows_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(windows.sys, "platform", "linux")
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    assert windows.discover_desktop() == tmp_path / "home" / "Desktop"
-    assert windows.default_data_dir() == tmp_path / "config" / "DesktopPilot"
-    monkeypatch.delenv("XDG_CONFIG_HOME")
-    assert windows.default_data_dir() == tmp_path / "home" / ".config" / "DesktopPilot"
-
-
-def test_windows_data_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(windows.sys, "platform", "win32")
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
-    assert windows.default_data_dir() == tmp_path / "local" / "DesktopPilot"
-
-
-def mock_shell(monkeypatch, *, status=0, value=r"C:\Users\test\OneDrive\Desktop"):
-    buffer = ctypes.create_unicode_buffer(value)
-    shell, ole = Mock(), Mock()
-    def read_path(folder_id, flags, token, output):
-        assert bytes(folder_id._obj) == uuid.UUID("b4bfcc3a-db2c-424c-b029-7fe99a87c641").bytes_le
-        assert flags == 0 and token is None
-        output._obj.value = ctypes.addressof(buffer)
-        return status
-    shell.SHGetKnownFolderPath.side_effect = read_path
-    def dll(name, **kwargs):
-        assert kwargs == {"use_last_error": True}
-        return {"shell32": shell, "ole32": ole}[name]
-    monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
-    return buffer, shell, ole
-
-
-def test_windows_discovery_uses_known_folder_and_frees_memory(monkeypatch):
-    buffer, shell, ole = mock_shell(monkeypatch)
-    monkeypatch.setattr(windows.sys, "platform", "win32")
-    assert windows.discover_desktop() == Path(r"C:\Users\test\OneDrive\Desktop")
-    shell.SHGetKnownFolderPath.assert_called_once()
-    ole.CoTaskMemFree.assert_called_once()
-    assert ole.CoTaskMemFree.call_args.args[0].value == ctypes.addressof(buffer)
-
-
-def test_windows_discovery_failure_never_guesses_and_frees_memory(monkeypatch):
-    _, _, ole = mock_shell(monkeypatch, status=-2147024891)
-    monkeypatch.setattr(windows.sys, "platform", "win32")
-    with pytest.raises(OSError, match="80070005"):
-        windows.discover_desktop()
-    ole.CoTaskMemFree.assert_called_once()
-
-
-def test_windows_discovery_empty_result_is_error(monkeypatch):
-    _, _, ole = mock_shell(monkeypatch, value="")
-    with pytest.raises(OSError, match="空"):
-        windows._known_folder_desktop()
-    ole.CoTaskMemFree.assert_called_once()
+        store.save_layouts([])
+    assert outside.read_bytes() == b"user data"

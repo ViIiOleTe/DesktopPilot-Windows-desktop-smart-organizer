@@ -33,6 +33,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Set up MSVC x64 and Windows SDK
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build native Explorer COM bridge
+        shell: cmd
+        run: tools\build_native.cmd
+
       - name: Run tests on Windows
         env:
           QT_QPA_PLATFORM: offscreen
@@ -41,7 +50,7 @@ jobs:
       - name: Build DesktopPilot.exe
         run: python -m PyInstaller --noconfirm --clean DesktopPilot.spec
 
-      - name: Smoke-test the packaged executable
+      - name: Smoke-test packaged simulated backend and DLL loading
         env:
           QT_QPA_PLATFORM: offscreen
         shell: pwsh
